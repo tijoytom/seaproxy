@@ -36,7 +36,8 @@ for a private connection to be reusable.
 SeaProxy supports Redis database 0 only. `SELECT` is rejected locally and does
 not consume a private backend connection.
 
-TLS is not implemented on either side of the proxy.
+TLS is supported for connections from SeaProxy to Redis. Frontend TLS is not
+implemented.
 
 ## Redis Cluster
 
@@ -103,9 +104,12 @@ required cluster mode also needs `CLUSTER INFO` and `CLUSTER SLOTS`.
 Connection recycling needs `RESET`; if it is denied, the private connection
 is safely discarded instead of reused.
 
-SeaProxy does not currently implement TLS. Frontend and backend credentials
-therefore travel as plaintext inside the Redis protocol and must be protected
-with trusted private networking or an external TLS tunnel.
+Enable backend TLS with `--redis-tls`. SeaProxy verifies the Redis certificate
+using the system trust store and `--redis-address` as the expected certificate
+name. Use `--redis-tls-ca-file` for a private PEM CA bundle or
+`--redis-tls-server-name` when the certificate name differs from the address
+used to connect. Frontend credentials still travel as plaintext and must be
+protected with trusted private networking or an external TLS tunnel.
 
 ## Admission control
 
@@ -188,6 +192,7 @@ cd ..
   --redis-address 127.0.0.1 \
   --redis-port 6379 \
   --redis-mode auto \
+  --redis-tls \
   --redis-username service \
   --redis-password-file /run/secrets/redis-password \
   --frontend-username application \
@@ -223,6 +228,9 @@ Application options:
 | `--redis-mode` | `auto` | Backend mode: `auto`, `standalone`, or `cluster`; immutable after startup |
 | `--redis-username` | empty | Redis backend ACL username; empty uses password-only `AUTH` |
 | `--redis-password-file` | empty | File containing the Redis backend password |
+| `--redis-tls` | disabled | Encrypt and authenticate Redis backend connections |
+| `--redis-tls-ca-file` | empty | PEM CA bundle for Redis TLS; empty uses system trust |
+| `--redis-tls-server-name` | empty | Expected Redis certificate name; empty uses `--redis-address` |
 | `--frontend-username` | empty | Username required from clients; requires a frontend password |
 | `--frontend-password-file` | empty | File containing the password required from clients |
 | `--redis-pool-size` | `1` | Multiplexed connections per shard |

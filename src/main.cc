@@ -166,6 +166,15 @@ int main(int argc, char** argv) {
         ("redis-password-file",
          bpo::value<std::string>()->default_value(""),
          "File containing the Redis backend password")
+        ("redis-tls",
+         bpo::bool_switch()->default_value(false),
+         "Use TLS for Redis backend connections")
+        ("redis-tls-ca-file",
+         bpo::value<std::string>()->default_value(""),
+         "PEM CA file for Redis TLS; empty uses the system trust store")
+        ("redis-tls-server-name",
+         bpo::value<std::string>()->default_value(""),
+         "Redis TLS certificate name; empty uses redis-address")
         ("frontend-username",
          bpo::value<std::string>()->default_value(""),
          "Frontend ACL username; empty accepts password-only AUTH")
@@ -220,6 +229,11 @@ int main(int argc, char** argv) {
                 options["redis-username"].as<std::string>();
         config.redis_password =
                 read_password_file(options, "redis-password-file");
+        config.redis_tls = options["redis-tls"].as<bool>();
+        config.redis_tls_ca_file =
+                options["redis-tls-ca-file"].as<std::string>();
+        config.redis_tls_server_name =
+                options["redis-tls-server-name"].as<std::string>();
         config.frontend_username =
                 options["frontend-username"].as<std::string>();
         config.frontend_password =
@@ -228,6 +242,12 @@ int main(int argc, char** argv) {
             config.redis_password.empty()) {
             throw std::invalid_argument(
                     "redis-username requires redis-password-file");
+        }
+        if (!config.redis_tls &&
+            (!config.redis_tls_ca_file.empty() ||
+             !config.redis_tls_server_name.empty())) {
+            throw std::invalid_argument(
+                    "redis-tls-ca-file and redis-tls-server-name require redis-tls");
         }
         if (!config.frontend_username.empty() &&
             config.frontend_password.empty()) {
