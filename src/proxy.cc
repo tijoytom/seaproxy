@@ -14,7 +14,9 @@
 #include <seastar/core/reactor.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/sleep.hh>
+#include <seastar/net/dns.hh>
 #include <seastar/net/inet_address.hh>
+#include <seastar/net/tls.hh>
 
 #include <fmt/format.h>
 
@@ -41,6 +43,18 @@ seastar::socket_address address_of(
         const std::string& address,
         std::uint16_t port) {
     return seastar::make_ipv4_address(seastar::ipv4_addr(address, port));
+}
+
+seastar::future<seastar::socket_address> resolve_address(
+        const std::string& address,
+        std::uint16_t port) {
+    auto host = co_await seastar::net::dns::get_host_by_name(address);
+    if (host.addr_list.empty()) {
+        throw std::runtime_error(
+                "backend address resolved without any IP addresses: " +
+                address);
+    }
+    co_return seastar::socket_address(host.addr_list.front(), port);
 }
 
 bool equal_ascii_case(std::string_view left, std::string_view right) {
@@ -197,6 +211,54 @@ BackendCredentials backend_credentials(const Config& config) {
     return {config.redis_username, config.redis_password};
 }
 
+class BackendConnector {
+public:
+    explicit BackendConnector(const Config& config)
+        : _tls(config.redis_tls)
+        , _ca_file(config.redis_tls_ca_file)
+        , _server_name(
+                  config.redis_tls_server_name.empty()
+                          ? config.redis_address
+                          : config.redis_tls_server_name) {
+    }
+
+    seastar::future<> start() {
+        if (!_tls) {
+            co_return;
+        }
+        seastar::tls::credentials_builder builder;
+        if (_ca_file.empty()) {
+            co_await builder.set_system_trust();
+        } else {
+            co_await builder.set_x509_trust_file(
+                    _ca_file, seastar::tls::x509_crt_format::PEM);
+        }
+        _credentials = builder.build_certificate_credentials();
+    }
+
+    seastar::future<seastar::connected_socket> connect(
+            seastar::socket_address address) const {
+        if (!_tls) {
+            co_return co_await seastar::engine().net().connect(address);
+        }
+        if (!_credentials) {
+            throw std::logic_error(
+                    "Redis TLS connector used before initialization");
+        }
+        seastar::tls::tls_options options;
+        options.server_name = _server_name;
+        options.wait_for_eof_on_shutdown = false;
+        co_return co_await seastar::tls::connect(
+                _credentials, address, std::move(options));
+    }
+
+private:
+    bool _tls;
+    std::string _ca_file;
+    seastar::sstring _server_name;
+    seastar::shared_ptr<seastar::tls::certificate_credentials> _credentials;
+};
+
 void append_bulk(seastar::sstring& request, std::string_view value) {
     request += "$";
     request += std::to_string(value.size());
@@ -228,10 +290,11 @@ seastar::future<bool> authenticate_redis(
 }
 
 seastar::future<seastar::sstring> query_redis(
+        const BackendConnector& connector,
         seastar::socket_address address,
         const BackendCredentials& credentials,
         std::string_view request) {
-    auto socket = co_await seastar::engine().net().connect(address);
+    auto socket = co_await connector.connect(address);
     RedisConnection connection(std::move(socket));
     try {
         if (!co_await authenticate_redis(connection, credentials)) {
@@ -255,9 +318,10 @@ seastar::future<seastar::sstring> query_redis(
 }
 
 seastar::future<> validate_redis_connection(
+        const BackendConnector& connector,
         seastar::socket_address address,
         const BackendCredentials& credentials) {
-    auto socket = co_await seastar::engine().net().connect(address);
+    auto socket = co_await connector.connect(address);
     RedisConnection connection(std::move(socket));
     try {
         if (!co_await authenticate_redis(connection, credentials)) {
@@ -278,10 +342,12 @@ public:
             seastar::socket_address address,
             std::size_t target,
             std::size_t maximum,
+            std::shared_ptr<BackendConnector> connector,
             BackendCredentials credentials)
         : _address(address)
         , _target(target)
         , _maximum(maximum)
+        , _connector(std::move(connector))
         , _credentials(std::move(credentials)) {
         if (_target > _maximum) {
             throw std::invalid_argument(
@@ -361,7 +427,7 @@ public:
 
 private:
     seastar::future<std::unique_ptr<RedisConnection>> connect_one() {
-        auto socket = co_await seastar::engine().net().connect(_address);
+        auto socket = co_await _connector->connect(_address);
         auto connection =
                 std::make_unique<RedisConnection>(std::move(socket));
         if (!co_await authenticate_redis(*connection, _credentials)) {
@@ -405,6 +471,7 @@ private:
     seastar::socket_address _address;
     std::size_t _target;
     std::size_t _maximum;
+    std::shared_ptr<BackendConnector> _connector;
     BackendCredentials _credentials;
     std::vector<std::unique_ptr<RedisConnection>> _idle;
     std::size_t _checked_out{0};
@@ -427,10 +494,12 @@ public:
             seastar::socket_address address,
             std::size_t pipeline_depth,
             std::size_t queue_capacity,
+            std::shared_ptr<BackendConnector> connector,
             BackendCredentials credentials)
         : _address(address)
         , _pipeline_depth(pipeline_depth)
         , _queue_slots(queue_capacity)
+        , _connector(std::move(connector))
         , _credentials(std::move(credentials)) {
     }
 
@@ -478,7 +547,7 @@ private:
             std::exception_ptr error;
             try {
                 auto socket =
-                        co_await seastar::engine().net().connect(_address);
+                        co_await _connector->connect(_address);
                 _connection =
                         std::make_unique<RedisConnection>(std::move(socket));
                 if (!co_await authenticate_redis(
@@ -569,6 +638,7 @@ private:
     seastar::socket_address _address;
     std::size_t _pipeline_depth;
     seastar::semaphore _queue_slots;
+    std::shared_ptr<BackendConnector> _connector;
     BackendCredentials _credentials;
     seastar::condition_variable _jobs_available;
     JobList _jobs;
@@ -584,22 +654,17 @@ seastar::future<bool> reset_private_connection(
 
 class RedisPool {
 public:
-    explicit RedisPool(const Config& config)
-        : RedisPool(
-                  config,
-                  address_of(config.redis_address, config.redis_port),
-                  config.private_pool_size) {
-    }
-
     RedisPool(
             const Config& config,
             seastar::socket_address address,
-            std::size_t private_pool_size)
+            std::size_t private_pool_size,
+            std::shared_ptr<BackendConnector> connector)
         : _credentials(backend_credentials(config))
         , _private(
                   address,
                   private_pool_size,
                   config.private_max_connections,
+                  connector,
                   _credentials) {
         _workers.reserve(config.redis_pool_size);
         for (std::size_t index = 0; index < config.redis_pool_size; ++index) {
@@ -607,6 +672,7 @@ public:
                     address,
                     config.pipeline_depth,
                     config.worker_queue_capacity,
+                    connector,
                     backend_credentials(config)));
         }
     }
@@ -723,13 +789,19 @@ public:
         seastar::sstring error;
     };
 
-    explicit ClusterRedisPool(Config config)
+    ClusterRedisPool(
+            Config config,
+            std::shared_ptr<BackendConnector> connector)
         : _config(std::move(config))
-        , _seed(address_of(_config.redis_address, _config.redis_port)) {
+        , _connector(std::move(connector))
+        , _seed() {
         _slots.fill(0);
     }
 
     seastar::future<> start() {
+        co_await _connector->start();
+        _seed = co_await resolve_address(
+                _config.redis_address, _config.redis_port);
         co_await refresh_topology();
     }
 
@@ -737,7 +809,10 @@ public:
         static constexpr std::string_view cluster_slots =
                 "*2\r\n$7\r\nCLUSTER\r\n$5\r\nSLOTS\r\n";
         auto response = co_await query_redis(
-                _seed, backend_credentials(_config), cluster_slots);
+                *_connector,
+                _seed,
+                backend_credentials(_config),
+                cluster_slots);
         auto topology = cluster::parse_cluster_slots(
                 std::string_view(response.data(), response.size()),
                 _config.redis_address);
@@ -881,8 +956,9 @@ private:
         }
         auto pool = std::make_unique<RedisPool>(
                 _config,
-                address_of(endpoint.address, endpoint.port),
-                _config.private_pool_size);
+                co_await resolve_address(endpoint.address, endpoint.port),
+                _config.private_pool_size,
+                _connector);
         co_await pool->start();
         _nodes.push_back(Node{endpoint, std::move(pool)});
         co_return _nodes.size() - 1;
@@ -939,6 +1015,7 @@ private:
     }
 
     Config _config;
+    std::shared_ptr<BackendConnector> _connector;
     seastar::socket_address _seed;
     std::vector<Node> _nodes;
     std::array<std::size_t, cluster::slot_count> _slots;
@@ -1530,16 +1607,22 @@ seastar::future<> handle_cluster_client(
 }  // namespace
 
 seastar::future<RedisMode> detect_redis_mode(const Config& config) {
+    BackendConnector connector(config);
+    co_await connector.start();
+    const auto address = co_await resolve_address(
+            config.redis_address, config.redis_port);
     if (config.redis_mode == RedisMode::standalone) {
         co_await validate_redis_connection(
-                address_of(config.redis_address, config.redis_port),
+                connector,
+                address,
                 backend_credentials(config));
         co_return RedisMode::standalone;
     }
     static constexpr std::string_view cluster_info =
             "*2\r\n$7\r\nCLUSTER\r\n$4\r\nINFO\r\n";
     auto response = co_await query_redis(
-            address_of(config.redis_address, config.redis_port),
+            connector,
+            address,
             backend_credentials(config),
             cluster_info);
     const auto view = std::string_view(response.data(), response.size());
@@ -1562,18 +1645,27 @@ class ProxyService::Impl {
 public:
     explicit Impl(Config config)
         : _config(std::move(config))
+        , _connector(std::make_shared<BackendConnector>(_config))
         , _client_slots(_config.max_clients_per_shard) {
-        if (_config.redis_mode == RedisMode::standalone) {
-            _standalone = std::make_unique<RedisPool>(_config);
-        } else if (_config.redis_mode == RedisMode::cluster) {
-            _cluster = std::make_unique<ClusterRedisPool>(_config);
-        } else {
+        if (_config.redis_mode == RedisMode::auto_detect) {
             throw std::logic_error(
                     "Redis mode must be detected before ProxyService starts");
         }
     }
 
     seastar::future<> start() {
+        co_await _connector->start();
+        if (_config.redis_mode == RedisMode::standalone) {
+            _standalone = std::make_unique<RedisPool>(
+                    _config,
+                    co_await resolve_address(
+                            _config.redis_address, _config.redis_port),
+                    _config.private_pool_size,
+                    _connector);
+        } else {
+            _cluster = std::make_unique<ClusterRedisPool>(
+                    _config, _connector);
+        }
         // Start the appropriate Redis pool based on the configured mode
         if (_standalone) {
             co_await _standalone->start();
@@ -1594,7 +1686,8 @@ public:
                 stderr,
                 "shard {} listening on {}:{} with {} multiplexed and {} "
                 "preconnected private redis connections to {}:{}; "
-                "mode={}; pipeline_depth={}; private_max_connections={}; "
+                "mode={}; backend_tls={}; pipeline_depth={}; "
+                "private_max_connections={}; "
                 "max_clients={}\n",
                 seastar::this_shard_id(),
                 _config.listen_address,
@@ -1604,6 +1697,7 @@ public:
                 _config.redis_address,
                 _config.redis_port,
                 _standalone ? "standalone" : "cluster",
+                _config.redis_tls ? "enabled" : "disabled",
                 _config.pipeline_depth,
                 _config.private_max_connections,
                 _config.max_clients_per_shard);
@@ -1690,6 +1784,7 @@ private:
     }
 
     Config _config;
+    std::shared_ptr<BackendConnector> _connector;
     seastar::semaphore _client_slots;
     std::unique_ptr<RedisPool> _standalone;
     std::unique_ptr<ClusterRedisPool> _cluster;

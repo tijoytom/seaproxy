@@ -23,6 +23,9 @@ struct Config {
     std::uint16_t redis_port{6379};
     std::string redis_username;
     std::string redis_password;
+    bool redis_tls{false};
+    std::string redis_tls_ca_file;
+    std::string redis_tls_server_name;
     std::string frontend_username;
     std::string frontend_password;
     std::size_t redis_pool_size{1};
