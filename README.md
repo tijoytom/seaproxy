@@ -7,14 +7,13 @@ cross cores.
 
 ## Architecture
 
-- One or more multiplexed Redis connections per shard.
-- Bounded shard-local request queues.
+- One or more multiplexed Redis connections per shard(per core).
 - Ordered backend pipelines with coalesced writes.
-- A preconnected private Redis pool per shard for connection-scoped commands.
-- Automatic, immutable standalone or Redis Cluster mode selection at startup.
+- A preconnected private Redis pool per shard for connection-scoped commands(ex BLPOP)
 - Shard-local Redis Cluster slot maps and per-primary connection pools.
 - Bounded frontend admission and hard private backend connection limits.
 - RESP2 request and RESP2/RESP3 response framing.
+- Backend TLS support using Seastar OpenSSL integration.
 
 Ordinary commands such as `GET` and `SET` use the multiplexed pool.
 Connection-scoped, blocking, transaction, and Pub/Sub commands switch the
@@ -28,13 +27,8 @@ transaction and connection-scoped sessions without leaking state such as
 SeaProxy conservatively closes and replaces a private connection when its
 state cannot be proven clean. This includes partial requests, missing or
 unexpected responses, reset failures, active blocking commands at disconnect,
-and asynchronous modes such as Pub/Sub and `MONITOR`. Arbitrary `CLIENT`
-commands also use this close-only path because they may enable push messages
-or alter reply behavior. The Redis user must have permission to run `RESET`
-for a private connection to be reusable.
+and asynchronous modes such as Pub/Sub and `MONITOR`. The Redis user must have permission to run `RESET` for a private connection to be reusable.
 
-SeaProxy supports Redis database 0 only. `SELECT` is rejected locally and does
-not consume a private backend connection.
 
 TLS is supported for connections from SeaProxy to Redis. Frontend TLS is not
 implemented.
@@ -56,7 +50,7 @@ In cluster mode, every Seastar shard:
 - Fetches and validates complete slot coverage using `CLUSTER SLOTS`.
 - Maintains a direct 16,384-entry slot table.
 - Owns multiplexed and private pools for each primary it uses.
-- Calculates Redis CRC16 slots, including hash tags such as `{account}:name`.
+- Calculates Redis CRC16 slots, including hash tags such as `{key}:name`.
 - Rejects cross-slot requests locally.
 - Handles `MOVED` by updating the slot and refreshing topology.
 - Handles `ASK` using an ordered `ASKING` plus command operation.
@@ -77,12 +71,6 @@ Backend authentication options:
 --redis-password-file <path>
 ```
 
-Leave `--redis-username` empty to use Redis's password-only `AUTH` form.
-SeaProxy authenticates before automatic mode detection, topology discovery,
-and use of every multiplexed or private connection. After sanitizing a private
-socket with `RESET`, SeaProxy authenticates it again before returning it to
-the pool.
-
 Frontend authentication options:
 
 ```text
@@ -96,20 +84,15 @@ other commands until authentication succeeds. Frontend credentials are never
 forwarded to Redis. If the frontend username is empty, password-only
 `AUTH <password>` and `AUTH default <password>` are accepted.
 Authentication or protocol renegotiation after a connection has entered a
-private relay is rejected by closing that client session, preventing it from
+private pool is rejected by closing that client session, preventing it from
 replacing SeaProxy's configured backend identity.
 
-The backend ACL user must be able to execute proxied commands. Automatic or
-required cluster mode also needs `CLUSTER INFO` and `CLUSTER SLOTS`.
-Connection recycling needs `RESET`; if it is denied, the private connection
-is safely discarded instead of reused.
 
 Enable backend TLS with `--redis-tls`. SeaProxy verifies the Redis certificate
 using the system trust store and `--redis-address` as the expected certificate
 name. Use `--redis-tls-ca-file` for a private PEM CA bundle or
 `--redis-tls-server-name` when the certificate name differs from the address
-used to connect. Frontend credentials still travel as plaintext and must be
-protected with trusted private networking or an external TLS tunnel.
+used to connect. Frontend credentials still travel as plaintext.
 
 ## Admission control
 
@@ -136,13 +119,6 @@ SeaProxy shard.
 private sessions still occupy frontend admission slots, so the frontend limit
 also bounds the private checkout wait queue.
 
-## Benchmarks
-
-See [benchmark.md](benchmark.md) for controlled comparisons with direct Redis
-covering multiplexed GET/SET traffic, connection-scoped `MULTI` transactions,
-and private backend connection recycling. The Go benchmark client is included
-in [benchclient](benchclient).
-
 ## Build
 
 SeaProxy is developed against Seastar `seastar-25.05.0`.
@@ -150,9 +126,6 @@ SeaProxy is developed against Seastar `seastar-25.05.0`.
 Build and install Seastar:
 
 ```sh
-git clone --branch seastar-25.05.0 --depth 1 \
-  https://github.com/scylladb/seastar.git ../seastar
-cd ../seastar
 sudo ./install-dependencies.sh
 ./configure.py \
   --mode=release \
@@ -172,15 +145,6 @@ cmake -S . -B build -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_PREFIX_PATH="$HOME/seastar-install"
 cmake --build build
-ctest --test-dir build --output-on-failure
-```
-
-Build the benchmark client:
-
-```sh
-cd benchclient
-go build -o ../build/benchclient .
-cd ..
 ```
 
 ## Run

@@ -1345,6 +1345,19 @@ seastar::future<bool> handle_frontend_control(
         if (!authenticated) {
             co_await write_frontend_response(
                     output, "-NOAUTH Authentication required.\r\n");
+        } else if (
+                arguments && arguments->size() >= 2 &&
+                (*arguments)[1] == "2") {
+            co_await write_frontend_response(
+                    output,
+                    "*14\r\n"
+                    "$6\r\nserver\r\n$8\r\nseaproxy\r\n"
+                    "$7\r\nversion\r\n$5\r\n0.1.0\r\n"
+                    "$5\r\nproto\r\n:2\r\n"
+                    "$2\r\nid\r\n:0\r\n"
+                    "$4\r\nmode\r\n$10\r\nstandalone\r\n"
+                    "$4\r\nrole\r\n$6\r\nmaster\r\n"
+                    "$7\r\nmodules\r\n*0\r\n");
         } else {
             co_await write_frontend_response(
                     output,

@@ -19,27 +19,29 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/redis/go-redis/v9"
+	"github.com/redis/rueidis"
 )
 
 type config struct {
-	address          string
-	concurrency      int
-	duration         time.Duration
-	keyspace         int64
-	valueSize        int
-	setPercent       int64
-	workload         string
-	transactionSize  int
-	connectionMode   string
-	backendStatsAddr string
-	clusterHashTags  bool
-	keyHashTag       string
-	username         string
-	password         string
-	tls              bool
-	cluster          bool
-	tlsServerName    string
+	address           string
+	concurrency       int
+	duration          time.Duration
+	keyspace          int64
+	valueSize         int
+	setPercent        int64
+	workload          string
+	transactionSize   int
+	connectionMode    string
+	clientPerWorker   bool
+	pipelineMultiplex int
+	backendStatsAddr  string
+	clusterHashTags   bool
+	keyHashTag        string
+	username          string
+	password          string
+	tls               bool
+	cluster           bool
+	tlsServerName     string
 }
 
 type counters struct {
@@ -101,6 +103,18 @@ func parseFlags() config {
 		"connection-mode",
 		connectionModePooled,
 		"connection lifecycle: pooled or per-transaction",
+	)
+	flag.BoolVar(
+		&cfg.clientPerWorker,
+		"client-per-worker",
+		false,
+		"create one non-multiplexed rueidis client per worker",
+	)
+	flag.IntVar(
+		&cfg.pipelineMultiplex,
+		"pipeline-multiplex",
+		0,
+		"rueidis pipeline connection exponent; connections per node are 2^value (0-8)",
 	)
 	flag.StringVar(
 		&cfg.backendStatsAddr,
@@ -166,6 +180,21 @@ func parseFlags() config {
 	if cfg.connectionMode == connectionModePerTransaction && cfg.workload != workloadMulti {
 		log.Fatal("-connection-mode per-transaction requires -workload multi")
 	}
+	if cfg.clientPerWorker && cfg.connectionMode == connectionModePerTransaction {
+		log.Fatal("-client-per-worker cannot be combined with -connection-mode per-transaction")
+	}
+	if cfg.pipelineMultiplex < 0 || cfg.pipelineMultiplex > rueidis.MaxPipelineMultiplex {
+		log.Fatalf(
+			"-pipeline-multiplex must be between 0 and %d",
+			rueidis.MaxPipelineMultiplex,
+		)
+	}
+	if cfg.pipelineMultiplex != 0 &&
+		(cfg.clientPerWorker || cfg.connectionMode == connectionModePerTransaction) {
+		log.Fatal(
+			"-pipeline-multiplex cannot be combined with dedicated client connection modes",
+		)
+	}
 	if cfg.clusterHashTags && cfg.keyHashTag != "" {
 		log.Fatal("-cluster-hash-tags and -key-hash-tag cannot be combined")
 	}
@@ -193,28 +222,55 @@ func run(cfg config) error {
 	parent, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	value := make([]byte, cfg.valueSize)
-	if _, err := cryptorand.Read(value); err != nil {
+	valueBytes := make([]byte, cfg.valueSize)
+	if _, err := cryptorand.Read(valueBytes); err != nil {
 		return fmt.Errorf("generate benchmark value: %w", err)
 	}
+	value := string(valueBytes)
 
 	var connections connectionCounters
-	client := newClient(cfg, &connections)
+	clientCount := 1
+	if cfg.clientPerWorker {
+		clientCount = cfg.concurrency
+	}
+	clients := make([]rueidis.Client, 0, clientCount)
+	for range clientCount {
+		client, err := newClient(cfg, &connections)
+		if err != nil {
+			closeClients(clients)
+			return fmt.Errorf("create Redis client: %w", err)
+		}
+		clients = append(clients, client)
+	}
 	pingCtx, cancelPing := context.WithTimeout(parent, 5*time.Second)
 	defer cancelPing()
-	if err := client.Ping(pingCtx).Err(); err != nil {
-		client.Close()
+	if err := clients[0].Do(pingCtx, clients[0].B().Ping().Build()).Error(); err != nil {
+		closeClients(clients)
 		return fmt.Errorf("connect to Redis at %s: %w", cfg.address, err)
 	}
 
-	var statsClient *redis.Client
+	var statsClient rueidis.Client
 	var statsBefore redisConnectionStats
+	var err error
 	if cfg.backendStatsAddr != "" {
-		statsClient = redis.NewClient(&redis.Options{Addr: cfg.backendStatsAddr})
-		var err error
+		statsClient, err = rueidis.NewClient(rueidis.ClientOption{
+			InitAddress:       []string{cfg.backendStatsAddr},
+			ForceSingleClient: true,
+			AlwaysRESP2:       true,
+			DisableCache:      true,
+			ClientSetInfo:     rueidis.DisableClientSetInfo,
+		})
+		if err != nil {
+			closeClients(clients)
+			return fmt.Errorf(
+				"create Redis stats client for %s: %w",
+				cfg.backendStatsAddr,
+				err,
+			)
+		}
 		statsBefore, err = readRedisConnectionStats(pingCtx, statsClient)
 		if err != nil {
-			client.Close()
+			closeClients(clients)
 			statsClient.Close()
 			return fmt.Errorf(
 				"read Redis connection stats from %s: %w",
@@ -235,6 +291,10 @@ func run(cfg config) error {
 	for workerID := range cfg.concurrency {
 		go func() {
 			defer workers.Done()
+			client := clients[0]
+			if cfg.clientPerWorker {
+				client = clients[workerID]
+			}
 			runWorker(
 				ctx,
 				client,
@@ -249,9 +309,7 @@ func run(cfg config) error {
 	workers.Wait()
 
 	elapsed := time.Since(start)
-	if err := client.Close(); err != nil {
-		return fmt.Errorf("close benchmark client: %w", err)
-	}
+	closeClients(clients)
 
 	var backendCreated uint64
 	var backendClosed uint64
@@ -268,9 +326,7 @@ func run(cfg config) error {
 		}
 		backendCreated = statsAfter.totalReceived - statsBefore.totalReceived
 		backendClosed = backendCreated + statsBefore.connected - statsAfter.connected
-		if err := statsClient.Close(); err != nil {
-			return fmt.Errorf("close Redis stats client: %w", err)
-		}
+		statsClient.Close()
 	}
 
 	gets := totals.gets.Load()
@@ -283,10 +339,11 @@ func run(cfg config) error {
 	if cfg.workload == workloadMulti {
 		commands := operations + 2*transactions
 		fmt.Printf(
-			"address=%s workload=%s connection_mode=%s concurrency=%d transaction_size=%d elapsed=%s transactions=%d transactions/sec=%.0f operations=%d ops/sec=%.0f commands=%d commands/sec=%.0f gets=%d sets=%d misses=%d errors=%d client_connections_created=%d client_connections_closed=%d",
+			"address=%s workload=%s connection_mode=%s client_per_worker=%t concurrency=%d transaction_size=%d elapsed=%s transactions=%d transactions/sec=%.0f operations=%d ops/sec=%.0f commands=%d commands/sec=%.0f gets=%d sets=%d misses=%d errors=%d client_connections_created=%d client_connections_closed=%d",
 			cfg.address,
 			cfg.workload,
 			cfg.connectionMode,
+			cfg.clientPerWorker,
 			cfg.concurrency,
 			cfg.transactionSize,
 			elapsed.Round(time.Millisecond),
@@ -314,10 +371,11 @@ func run(cfg config) error {
 		fmt.Println()
 	} else {
 		fmt.Printf(
-			"address=%s workload=%s connection_mode=%s concurrency=%d elapsed=%s operations=%d ops/sec=%.0f gets=%d sets=%d misses=%d errors=%d client_connections_created=%d client_connections_closed=%d\n",
+			"address=%s workload=%s connection_mode=%s client_per_worker=%t concurrency=%d elapsed=%s operations=%d ops/sec=%.0f gets=%d sets=%d misses=%d errors=%d client_connections_created=%d client_connections_closed=%d\n",
 			cfg.address,
 			cfg.workload,
 			cfg.connectionMode,
+			cfg.clientPerWorker,
 			cfg.concurrency,
 			elapsed.Round(time.Millisecond),
 			operations,
@@ -337,12 +395,18 @@ func run(cfg config) error {
 	return nil
 }
 
+func closeClients(clients []rueidis.Client) {
+	for _, client := range clients {
+		client.Close()
+	}
+}
+
 func runWorker(
 	ctx context.Context,
-	client redis.UniversalClient,
+	client rueidis.Client,
 	cfg config,
 	workerID int,
-	value []byte,
+	value string,
 	totals *counters,
 	connections *connectionCounters,
 ) {
@@ -370,7 +434,10 @@ func runWorker(
 
 		key := nextKey(cfg, workerID, &operation)
 		if random.Int64N(100) < cfg.setPercent {
-			err := client.Set(ctx, key, value, 0).Err()
+			err := client.Do(
+				ctx,
+				client.B().Set().Key(key).Value(value).Build(),
+			).Error()
 			if err != nil {
 				if !isContextDone(err) {
 					totals.errors.Add(1)
@@ -381,11 +448,11 @@ func runWorker(
 			continue
 		}
 
-		err := client.Get(ctx, key).Err()
+		err := client.Do(ctx, client.B().Get().Key(key).Build()).Error()
 		switch {
 		case err == nil:
 			totals.gets.Add(1)
-		case errors.Is(err, redis.Nil):
+		case rueidis.IsRedisNil(err):
 			totals.gets.Add(1)
 			totals.misses.Add(1)
 		case !isContextDone(err):
@@ -396,10 +463,10 @@ func runWorker(
 
 func runTransaction(
 	ctx context.Context,
-	client redis.UniversalClient,
+	client rueidis.Client,
 	cfg config,
 	workerID int,
-	value []byte,
+	value string,
 	totals *counters,
 	connections *connectionCounters,
 	random *rand.Rand,
@@ -407,44 +474,84 @@ func runTransaction(
 ) {
 	transactionClient := client
 	if cfg.connectionMode == connectionModePerTransaction {
-		transactionClient = newClient(cfg, connections)
+		var err error
+		transactionClient, err = newClient(cfg, connections)
+		if err != nil {
+			totals.errors.Add(1)
+			return
+		}
 		defer transactionClient.Close()
 	}
 
 	var gets uint64
 	var sets uint64
-	var getCommands []*redis.StringCmd
+	var getIndexes []int
 	transactionTag := ""
 	if cfg.clusterHashTags {
 		tag := (uint64(workerID) + *operation*uint64(cfg.concurrency)) %
 			uint64(cfg.keyspace)
 		transactionTag = fmt.Sprintf("{benchclient:%d}:", tag)
 	}
-	_, err := transactionClient.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+	var transactionResults []rueidis.RedisResult
+	err := transactionClient.Dedicated(func(dedicated rueidis.DedicatedClient) error {
+		commands := make([]rueidis.Completed, 0, cfg.transactionSize+2)
+		keys := make([]string, 0, cfg.transactionSize)
 		for range cfg.transactionSize {
 			key := transactionTag + nextKey(cfg, workerID, operation)
+			keys = append(keys, key)
 			if random.Int64N(100) < cfg.setPercent {
-				pipe.Set(ctx, key, value, 0)
+				commands = append(
+					commands,
+					dedicated.B().Set().Key(key).Value(value).Build(),
+				)
 				sets++
 			} else {
-				getCommands = append(getCommands, pipe.Get(ctx, key))
+				getIndexes = append(getIndexes, len(commands))
+				commands = append(commands, dedicated.B().Get().Key(key).Build())
 				gets++
 			}
 		}
+		slotKey := keys[0]
+		multi := dedicated.B().Multi().Build().SetSlot(slotKey)
+		exec := dedicated.B().Exec().Build().SetSlot(slotKey)
+		pipeline := make([]rueidis.Completed, 0, len(commands)+2)
+		pipeline = append(pipeline, multi)
+		pipeline = append(pipeline, commands...)
+		pipeline = append(pipeline, exec)
+		transactionResults = dedicated.DoMulti(ctx, pipeline...)
 		return nil
 	})
-	if err != nil && !errors.Is(err, redis.Nil) {
+	if err != nil {
 		if !isContextDone(err) {
+			totals.errors.Add(1)
+		}
+		return
+	}
+	if len(transactionResults) != cfg.transactionSize+2 {
+		totals.errors.Add(1)
+		return
+	}
+	for _, result := range transactionResults[:len(transactionResults)-1] {
+		if err := result.Error(); err != nil {
+			if !isContextDone(err) {
+				totals.errors.Add(1)
+			}
+			return
+		}
+	}
+	execResults, err := transactionResults[len(transactionResults)-1].ToArray()
+	if err != nil || len(execResults) != cfg.transactionSize {
+		if err == nil || !isContextDone(err) {
 			totals.errors.Add(1)
 		}
 		return
 	}
 
 	var misses uint64
-	for _, command := range getCommands {
-		switch err := command.Err(); {
+	for _, index := range getIndexes {
+		switch err := execResults[index].Error(); {
 		case err == nil:
-		case errors.Is(err, redis.Nil):
+		case rueidis.IsRedisNil(err):
 			misses++
 		case isContextDone(err):
 			return
@@ -469,7 +576,7 @@ func nextKey(cfg config, workerID int, operation *uint64) string {
 	return fmt.Sprintf("benchclient:%d", keyNumber)
 }
 
-func newClient(cfg config, totals *connectionCounters) redis.UniversalClient {
+func newClient(cfg config, totals *connectionCounters) (rueidis.Client, error) {
 	netDialer := &net.Dialer{}
 	var tlsConfig *tls.Config
 	if cfg.tls {
@@ -486,17 +593,22 @@ func newClient(cfg config, totals *connectionCounters) redis.UniversalClient {
 			ServerName: serverName,
 		}
 	}
-	dial := func(ctx context.Context, network, address string) (net.Conn, error) {
+	dial := func(
+		ctx context.Context,
+		address string,
+		dialer *net.Dialer,
+		tlsConfig *tls.Config,
+	) (net.Conn, error) {
 		var connection net.Conn
 		var err error
 		if tlsConfig == nil {
-			connection, err = netDialer.DialContext(ctx, network, address)
+			connection, err = dialer.DialContext(ctx, "tcp", address)
 		} else {
 			tlsDialer := &tls.Dialer{
-				NetDialer: netDialer,
+				NetDialer: dialer,
 				Config:    tlsConfig,
 			}
-			connection, err = tlsDialer.DialContext(ctx, network, address)
+			connection, err = tlsDialer.DialContext(ctx, "tcp", address)
 		}
 		if err != nil {
 			return nil, err
@@ -507,21 +619,22 @@ func newClient(cfg config, totals *connectionCounters) redis.UniversalClient {
 			totals: totals,
 		}, nil
 	}
-	if cfg.cluster {
-		return redis.NewClusterClient(&redis.ClusterOptions{
-			Addrs:    []string{cfg.address},
-			PoolSize: cfg.concurrency,
-			Username: cfg.username,
-			Password: cfg.password,
-			Dialer:   dial,
-		})
+	pipelineMultiplex := cfg.pipelineMultiplex
+	if cfg.clientPerWorker || cfg.connectionMode == connectionModePerTransaction {
+		pipelineMultiplex = -1
 	}
-	return redis.NewClient(&redis.Options{
-		Addr:     cfg.address,
-		PoolSize: cfg.concurrency,
-		Username: cfg.username,
-		Password: cfg.password,
-		Dialer:   dial,
+	return rueidis.NewClient(rueidis.ClientOption{
+		InitAddress:       []string{cfg.address},
+		Username:          cfg.username,
+		Password:          cfg.password,
+		TLSConfig:         tlsConfig,
+		Dialer:            *netDialer,
+		DialCtxFn:         dial,
+		ForceSingleClient: !cfg.cluster,
+		AlwaysRESP2:       true,
+		DisableCache:      true,
+		PipelineMultiplex: pipelineMultiplex,
+		ClientSetInfo:     rueidis.DisableClientSetInfo,
 	})
 }
 
@@ -534,9 +647,9 @@ func (connection *countedConnection) Close() error {
 
 func readRedisConnectionStats(
 	ctx context.Context,
-	client *redis.Client,
+	client rueidis.Client,
 ) (redisConnectionStats, error) {
-	info, err := client.Info(ctx).Result()
+	info, err := client.Do(ctx, client.B().Info().Build()).ToString()
 	if err != nil {
 		return redisConnectionStats{}, err
 	}
