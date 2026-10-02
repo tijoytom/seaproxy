@@ -141,6 +141,29 @@ For example, a GitHub Actions build step can use:
 JOBS=2 ./build.sh
 ```
 
+### Native release packages
+
+After building, create Ubuntu 24.04 AMD64 `.deb` and `.tar.gz` packages with
+SHA-256 checksums:
+
+```sh
+./package-release.sh 0.1.0
+```
+
+The version must match the project version in `CMakeLists.txt`. Packages are
+written to `dist/`.
+
+Pushing a matching semantic-version tag runs the GitHub release workflow:
+
+```sh
+git tag -a v0.1.0 -m "SeaProxy v0.1.0"
+git push origin v0.1.0
+```
+
+The workflow builds and tests SeaProxy, creates both native packages, and
+attaches them and their checksums to a generated GitHub Release. It does not
+build or publish a container image.
+
 ### Container image
 
 Build a local OCI image using Docker or Podman:
