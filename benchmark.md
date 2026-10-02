@@ -1,172 +1,91 @@
 # SeaProxy Benchmarks
 
 These benchmarks compare SeaProxy with direct Redis access for ordinary
-multiplexed commands and connection-scoped `MULTI` transactions. Results were
-collected on October 1, 2026.
+multiplexed commands. Results were collected on October 1 and 2, 2026.
 
-## Test environment
+## Local Redis shard scaling results
 
-- Redis 7.0.15 on CPU 0.
+The scaling benchmark used 800 concurrent go-redis workers, an 80% GET / 20%
+SET workload, 10,000 keys, 128-byte values, and one backend Redis connection
+per SeaProxy shard. SeaProxy and Redis ran on separate VMs.
+
+| Target | Samples (ops/sec) | Mean | Relative to one shard | Scaling efficiency | Relative to direct Redis |
+|---|---|---:|---:|---:|---:|
+| Direct Redis using go-redis | 89,591; 89,481; 89,411 | **89,494** | - | - | 1.00x |
+| SeaProxy, 1 shard | 124,218; 124,004; 123,312 | **123,845** | 1.00x | 100.0% | 1.38x |
+| SeaProxy, 2 shards | 261,030; 262,472; 263,886 | **262,463** | 2.12x | 106.0% | 2.93x |
+| SeaProxy, 3 shards | 372,006; 373,737; 371,373 | **372,372** | 3.01x | 100.2% | 4.16x |
+| SeaProxy, 4 shards | 483,414; 486,621; 475,283 | **481,773** | 3.89x | 97.2% | 5.38x |
+
+```mermaid
+xychart-beta
+    title "SeaProxy throughput by shard count"
+    x-axis "SeaProxy shards" [1, 2, 3, 4]
+    y-axis "Operations per second" 0 --> 500000
+    line [123845, 262463, 372372, 481773]
+    line [89494, 89494, 89494, 89494]
+```
+
+Graph series, in order: SeaProxy and direct Redis using go-redis.
+
+## AMR TLS benchmark results
+
+The AMR benchmark used an 80% GET / 20% SET workload, 10,000 keys,
+128-byte values, and Private Link. All backend connections used TLS.
+
+### Concurrency scaling
+
+| Workers | Direct AMR using go-redis | SeaProxy, 4 shards, pool size 8 |
+|---:|---:|---:|
+| 50 | 137,384 ops/sec | 116,782 ops/sec |
+| 100 | 196,498 ops/sec | 162,080 ops/sec |
+| 200 | 241,129 ops/sec | 231,999 ops/sec |
+| 400 | 270,326 ops/sec | 320,284 ops/sec |
+| 800 | 271,725 ops/sec | 376,786 ops/sec |
+
+### Shard scaling at 800 workers
+
+Each SeaProxy shard used eight multiplexed connections per AMR primary. The
+results are three 20-second samples after prepopulating the full keyspace.
+
+| Target | Samples (ops/sec) | Mean | Relative to one shard | Scaling efficiency | Relative to direct AMR |
+|---|---|---:|---:|---:|---:|
+| Direct AMR using go-redis | 272,138; 271,663; 276,749 | **273,517** | - | - | 1.00x |
+| SeaProxy, 1 shard | 109,601; 108,344; 111,934 | **109,960** | 1.00x | 100.0% | 0.40x |
+| SeaProxy, 2 shards | 216,530; 214,199; 214,541 | **215,090** | 1.96x | 97.8% | 0.79x |
+| SeaProxy, 3 shards | 307,151; 309,299; 308,277 | **308,242** | 2.80x | 93.4% | 1.13x |
+| SeaProxy, 4 shards | 380,321; 382,837; 383,234 | **382,131** | 3.48x | 86.9% | 1.40x |
+
+```mermaid
+xychart-beta
+    title "AMR TLS throughput by SeaProxy shard count"
+    x-axis "SeaProxy shards" [1, 2, 3, 4]
+    y-axis "Operations per second" 0 --> 400000
+    line [109960, 215090, 308242, 382131]
+    line [273517, 273517, 273517, 273517]
+```
+
+Graph series, in order: SeaProxy and direct AMR using go-redis.
+
+## Local benchmark test environment
+
+- Redis 7.0.15 ran on a separate 2-vCPU VM and was pinned to CPU 0.
+- SeaProxy and the go-redis benchmark client ran on a 16-vCPU VM with eight
+  physical cores and two hardware threads per core.
 - SeaProxy Release build using Seastar 25.05.0 and the epoll reactor.
-- Three SeaProxy shards on CPUs 2, 4, and 6.
-- Go benchmark client on CPUs 3, 5, and 7.
-- CPUs 2/3, 4/5, and 6/7 are sibling hardware threads.
+- SeaProxy used one to four shards on CPUs 0, 2, 4, and 6.
+- The go-redis benchmark client used CPUs 8 through 15.
+- SeaProxy and the benchmark client did not share physical cores.
 - One multiplexed Redis connection per SeaProxy shard.
 - Pipeline depth 64.
-- Worker queue capacity 1024 per multiplexed connection.
-- 50 concurrent go-redis workers.
-- 10-second measured runs after a warm-up.
+- Worker queue capacity 2048 per multiplexed connection.
+- 800 concurrent go-redis workers.
+- Three 20-second measured runs after a 10-second warm-up.
+- The workload used 80% GET, 20% SET, 10,000 keys, and 128-byte values.
+- Redis traffic used the VMs' private IP addresses.
 
 SeaProxy was started through an outer `taskset` in addition to receiving its
 Seastar `--cpuset` option. With `--overprovisioned`, the Seastar option alone
 did not restrict every Linux thread in this environment.
 
 All reported workloads completed with zero command errors and zero GET misses.
-
-## Multiplexed GET/SET benchmark
-
-This workload uses ordinary commands handled by SeaProxy's multiplexed path:
-
-- 80% `GET` and 20% `SET`.
-- 10,000-key keyspace.
-- 128-byte values.
-- Pooled client connections.
-
-### Results
-
-| Target | Samples (ops/sec) | Mean | Median | Relative to direct Redis |
-|---|---|---:|---:|---:|
-| Direct Redis | 191,013; 194,202; 195,509; 195,423; 195,460 | 194,321 | 195,423 | Baseline |
-| SeaProxy | 266,501; 266,685; 262,594; 265,812; 256,972 | **263,713** | **265,812** | **+35.7% mean throughput** |
-
-SeaProxy multiplexes 50 frontend client connections over three backend Redis
-connections. This reduces Redis socket handling and enables ordered,
-coalesced backend pipelines. Under this workload, those savings outweigh the
-additional proxy hop.
-
-### Reproduction
-
-Build the in-repository benchmark client from the SeaProxy root:
-
-```sh
-cd benchclient
-go build -o ../build/benchclient .
-cd ..
-```
-
-Start SeaProxy:
-
-```sh
-taskset -c 2,4,6 ./build/seaproxy \
-  --listen-address 127.0.0.1 \
-  --listen-port 7000 \
-  --redis-address 127.0.0.1 \
-  --redis-port 6379 \
-  --redis-pool-size 1 \
-  --pipeline-depth 64 \
-  --private-pool-size 10 \
-  --worker-queue-capacity 1024 \
-  --smp 3 \
-  --cpuset 2,4,6 \
-  --memory 1G \
-  --overprovisioned
-```
-
-Run through SeaProxy:
-
-```sh
-taskset -c 3,5,7 ./build/benchclient \
-  -addr 127.0.0.1:7000 \
-  -workload getset \
-  -concurrency 50 \
-  -duration 10s \
-  -keyspace 10000 \
-  -set-percent 20 \
-  -value-size 128
-```
-
-Run directly against Redis:
-
-```sh
-taskset -c 3,5,7 ./build/benchclient \
-  -addr 127.0.0.1:6379 \
-  -workload getset \
-  -concurrency 50 \
-  -duration 10s \
-  -keyspace 10000 \
-  -set-percent 20 \
-  -value-size 128
-```
-
-## Connection-scoped MULTI benchmark
-
-This workload executes transactions containing:
-
-1. `MULTI`
-2. Four queued GET/SET operations using the same 80/20 mix
-3. `EXEC`
-
-Each transaction therefore represents four logical operations and six Redis
-commands. Every transaction creates and closes a frontend connection,
-exercising private connection checkout, `RESET`, and recycling.
-
-### Results
-
-| Target | Transactions/sec | Commands/sec | Frontend connections created/run | Backend connections created/closed per run |
-|---|---:|---:|---:|
-| Direct Redis | 14,349 | 86,095 | about 143,545 | about 143,558/143,559 |
-| SeaProxy, private pool 10/shard | 12,915 | 77,488 | about 129,213 | 17,704/17,704 |
-| SeaProxy, private pool 20/shard | **14,504** | **87,021** | about 145,106 | **11/11** |
-
-The five-run transaction-rate samples were:
-
-- Direct Redis: 14,351; 14,333; 14,387; 14,324; 14,351.
-- SeaProxy with 10 private connections per shard: 12,929; 12,926; 12,902;
-  12,900; 12,917.
-- SeaProxy with 20 private connections per shard: 14,487; 14,482; 14,529;
-  14,520; 14,500.
-
-With 10 private connections per shard, approximately 86.3% of private
-sessions reused an existing backend connection. The remaining sessions needed
-temporary backend connections when a shard exceeded its local pool capacity.
-Throughput was 10.0% below direct Redis.
-
-Increasing the private pool to 20 connections per shard reduced backend churn
-to an average of 11 connections across more than 145,000 frontend sessions.
-More than 99.99% of sessions reused a sanitized backend connection. SeaProxy
-then reached 14,504 transactions/sec, 1.1% above direct Redis, because Redis
-avoided almost all TCP connection setup and teardown.
-
-Private pools are shard-local. The configured total should exceed expected
-private concurrency with enough headroom for uneven connection distribution
-between shards.
-
-### Reproduction
-
-Run one connection per transaction through SeaProxy:
-
-```sh
-taskset -c 3,5,7 ./build/benchclient \
-  -addr 127.0.0.1:7000 \
-  -workload multi \
-  -connection-mode per-transaction \
-  -transaction-size 4 \
-  -concurrency 50 \
-  -duration 10s \
-  -backend-stats-addr 127.0.0.1:6379
-```
-
-For the direct comparison, change `-addr` to `127.0.0.1:6379`. Keep
-`-backend-stats-addr` pointed at Redis.
-
-## Summary
-
-- Multiplexed GET/SET throughput through SeaProxy reached a 263,713 ops/sec
-  mean, 35.7% higher than direct Redis, because 50 frontend connections shared
-  three pipelined backend connections.
-- Short-lived `MULTI` sessions require a private pool sized for peak
-  per-shard concurrency. Increasing the pool from 10 to 20 connections per
-  shard reduced measured backend churn from 17,704 connections to 11.
-- With the larger private pool, short-lived transaction throughput through
-  SeaProxy was 1.1% higher than direct Redis while recycling more than 99.99%
-  of private backend connections.
