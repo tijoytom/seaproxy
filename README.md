@@ -123,28 +123,22 @@ also bounds the private checkout wait queue.
 
 SeaProxy is developed against Seastar `seastar-25.05.0`.
 
-Build and install Seastar:
+On Ubuntu, `build.sh` installs Seastar's system dependencies, downloads and
+builds the pinned Seastar release, builds SeaProxy, and runs its tests:
 
 ```sh
-sudo ./install-dependencies.sh
-./configure.py \
-  --mode=release \
-  --without-tests \
-  --without-apps \
-  --without-demos \
-  --disable-dpdk \
-  --enable-io_uring \
-  --prefix="$HOME/seastar-install"
-ninja -C build/release install
+./build.sh
 ```
 
-Build SeaProxy:
+The script stores downloaded dependencies under `.deps/` so that directory can
+be cached by CI. Set `SKIP_DEPENDENCY_INSTALL=1` when the required system
+packages are already installed. `DEPS_DIR`, `SEASTAR_PREFIX`, `BUILD_DIR`,
+`BUILD_TYPE`, and `JOBS` can also be overridden.
+
+For example, a GitHub Actions build step can use:
 
 ```sh
-cmake -S . -B build -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_PREFIX_PATH="$HOME/seastar-install"
-cmake --build build
+JOBS=2 ./build.sh
 ```
 
 ## Run
