@@ -1,9 +1,9 @@
 # SeaProxy Benchmarks
 
 These benchmarks compare SeaProxy with direct Redis access for ordinary
-multiplexed commands. Results were collected on October 1 and 2, 2026.
+multiplexed commands.
 
-## Local Redis shard scaling results
+## Local Redis(in a VM)
 
 The scaling benchmark used 800 concurrent go-redis workers, an 80% GET / 20%
 SET workload, 10,000 keys, 128-byte values, and one backend Redis connection
@@ -17,18 +17,7 @@ per SeaProxy shard. SeaProxy and Redis ran on separate VMs.
 | SeaProxy, 3 shards | 372,006; 373,737; 371,373 | **372,372** | 3.01x | 100.2% | 4.16x |
 | SeaProxy, 4 shards | 483,414; 486,621; 475,283 | **481,773** | 3.89x | 97.2% | 5.38x |
 
-```mermaid
-xychart-beta
-    title "SeaProxy throughput by shard count"
-    x-axis "SeaProxy shards" [1, 2, 3, 4]
-    y-axis "Operations per second" 0 --> 500000
-    line [123845, 262463, 372372, 481773]
-    line [89494, 89494, 89494, 89494]
-```
-
-Graph series, in order: SeaProxy and direct Redis using go-redis.
-
-## AMR TLS benchmark results
+## Azure Managed Redis(AMR) TLS benchmark results
 
 The AMR benchmark used an 80% GET / 20% SET workload, 10,000 keys,
 128-byte values, and Private Link. All backend connections used TLS.
@@ -56,16 +45,25 @@ results are three 20-second samples after prepopulating the full keyspace.
 | SeaProxy, 3 shards | 307,151; 309,299; 308,277 | **308,242** | 2.80x | 93.4% | 1.13x |
 | SeaProxy, 4 shards | 380,321; 382,837; 383,234 | **382,131** | 3.48x | 86.9% | 1.40x |
 
-```mermaid
-xychart-beta
-    title "AMR TLS throughput by SeaProxy shard count"
-    x-axis "SeaProxy shards" [1, 2, 3, 4]
-    y-axis "Operations per second" 0 --> 400000
-    line [109960, 215090, 308242, 382131]
-    line [273517, 273517, 273517, 273517]
-```
+### Rueidis at 800 concurrent workers
 
-Graph series, in order: SeaProxy and direct AMR using go-redis.
+The direct AMR test used one shared rueidis Cluster client, allowing rueidis to
+pipeline requests from all 800 workers over 32 TLS data connections per AMR
+primary. The SeaProxy test used one non-multiplexed rueidis client per worker,
+providing 800 independent frontend sessions. SeaProxy used four shards and
+eight multiplexed backend connections per AMR primary. Both paths therefore
+used 64 persistent data-plane TLS connections across the two AMR primaries.
+
+| Target | Samples (ops/sec) | Mean | Frontend sessions | AMR TLS data connections |
+|---|---|---:|---:|---:|
+| Direct AMR, shared rueidis automatic pipelines | 333,589; 334,832; 333,494 | **333,972** | 800 workers | 64 |
+| SeaProxy, 4 shards, non-multiplexed rueidis clients | 344,912; 347,432; 354,700 | **349,015** | 800 connections | 64 |
+
+All samples were 20 seconds after warm-up and completed with zero command
+errors and zero GET misses. Rueidis created two additional cluster
+bootstrap/topology connections during each direct run. SeaProxy delivered
+1.05x the direct rueidis throughput with matched data-plane TLS connection
+counts.
 
 ## Local benchmark test environment
 
