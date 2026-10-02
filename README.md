@@ -141,8 +141,6 @@ For example, a GitHub Actions build step can use:
 JOBS=2 ./build.sh
 ```
 
-<<<<<<< Updated upstream
-=======
 ### Native release packages
 
 After building, create Ubuntu 24.04 AMD64 `.deb` and `.tar.gz` packages with
@@ -196,7 +194,6 @@ system CA store for backend TLS, and exposes port 7000. For production, mount
 password and private CA files as read-only secrets rather than including them
 in an image.
 
->>>>>>> Stashed changes
 ## Run
 
 ```sh
