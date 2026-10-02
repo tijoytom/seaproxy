@@ -1,0 +1,42 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Cache Seastar
+        uses: actions/cache@v4
+        with:
+          path: .deps
+          key: seastar-25.05.0-ubuntu-24.04-amd64
+
+      - name: Build and test
+        run: JOBS=2 ./build.sh
+
+      - name: Package release
+        run: ./package-release.sh "${GITHUB_REF_NAME#v}"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          gh release create "${GITHUB_REF_NAME}" \
+            "dist/seaproxy-${version}-ubuntu24.04-amd64.deb" \
+            "dist/seaproxy-${version}-ubuntu24.04-amd64.tar.gz" \
+            "dist/seaproxy-${version}-ubuntu24.04-amd64.sha256" \
+            --generate-notes \
+            --title "SeaProxy ${GITHUB_REF_NAME}" \
+            --verify-tag

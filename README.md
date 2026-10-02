@@ -141,6 +141,62 @@ For example, a GitHub Actions build step can use:
 JOBS=2 ./build.sh
 ```
 
+<<<<<<< Updated upstream
+=======
+### Native release packages
+
+After building, create Ubuntu 24.04 AMD64 `.deb` and `.tar.gz` packages with
+SHA-256 checksums:
+
+```sh
+./package-release.sh 0.1.0
+```
+
+The version must match the project version in `CMakeLists.txt`. Packages are
+written to `dist/`.
+
+Pushing a matching semantic-version tag runs the GitHub release workflow:
+
+```sh
+git tag -a v0.1.0 -m "SeaProxy v0.1.0"
+git push origin v0.1.0
+```
+
+The workflow builds and tests SeaProxy, creates both native packages, and
+attaches them and their checksums to a generated GitHub Release. It does not
+build or publish a container image.
+
+### Container image
+
+Build a local OCI image using Docker or Podman:
+
+```sh
+./build-container.sh
+```
+
+The default image is `seaproxy:dev`. Use `--image` to assign another local
+tag:
+
+```sh
+./build-container.sh --image seaproxy:0.1.0 --jobs 4
+```
+
+Image publishing is intentionally opt-in. `--push` requires an explicitly
+registry-qualified image name, preventing an accidental push while the
+official image registry and namespace are undecided:
+
+```sh
+./build-container.sh \
+  --image ghcr.io/owner/seaproxy:0.1.0 \
+  --push
+```
+
+The runtime image is based on Ubuntu 24.04, runs as UID 10001, includes the
+system CA store for backend TLS, and exposes port 7000. For production, mount
+password and private CA files as read-only secrets rather than including them
+in an image.
+
+>>>>>>> Stashed changes
 ## Run
 
 ```sh
