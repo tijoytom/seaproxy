@@ -16,6 +16,7 @@ void require(bool condition, const char* message) {
 }  // namespace
 
 int main() {
+    using seaproxy::resp::CommandParser;
     using seaproxy::resp::command_argument;
     using seaproxy::resp::command_arguments;
     using seaproxy::resp::command_name;
@@ -39,6 +40,16 @@ int main() {
     require(command_argument(request, 1) == "key", "array command argument");
     require(command_arguments(request)->size() == 2, "array command arguments");
     require(command_name("ping\r\n") == "ping", "inline command name");
+    CommandParser parser(request);
+    require(parser.remaining() == 2, "parser initial argument count");
+    require(parser.next() == "get", "parser command");
+    require(parser.remaining() == 1, "parser remaining argument count");
+    require(parser.next() == "key", "parser key");
+    require(!parser.next() && parser.valid(), "parser clean end");
+    CommandParser invalid_parser("*2\r\n$3\r\nGET\r\n:1\r\n");
+    require(invalid_parser.next() == "GET", "invalid parser first argument");
+    require(!invalid_parser.next() && !invalid_parser.valid(),
+            "reject non-string command argument");
 
     const std::string first = "*1\r\n$4\r\nPING\r\n";
     require(frame_length(first + request) == first.size(), "first pipelined frame");
@@ -51,6 +62,7 @@ int main() {
     require(key_slot("foo{shared}1") == key_slot("bar{shared}2"),
             "cluster hash tags");
     require(key_slot("123456789") == 12739, "Redis CRC16 test vector");
+    require(key_slot("foo") == 12182, "Redis key slot test vector");
     require(route_request(request).status == RouteStatus::ok,
             "route single-key command");
     const std::string same_slot =
@@ -69,6 +81,32 @@ int main() {
             "*4\r\n$5\r\nBLPOP\r\n$3\r\none\r\n$3\r\ntwo\r\n$1\r\n0\r\n";
     require(route_request(blocking_cross_slot).status == RouteStatus::cross_slot,
             "reject cross-slot blocking command");
+    const std::string mset_same_slot =
+            "*5\r\n$4\r\nMSET\r\n$5\r\n{a}:1\r\n$1\r\n1\r\n"
+            "$5\r\n{a}:2\r\n$1\r\n2\r\n";
+    require(route_request(mset_same_slot).status == RouteStatus::ok,
+            "route same-slot MSET");
+    const std::string mset_cross_slot =
+            "*5\r\n$4\r\nMSET\r\n$3\r\none\r\n$1\r\n1\r\n"
+            "$3\r\ntwo\r\n$1\r\n2\r\n";
+    require(route_request(mset_cross_slot).status == RouteStatus::cross_slot,
+            "reject cross-slot MSET");
+    const std::string invalid_bitop =
+            "*3\r\n$5\r\nBITOP\r\n$3\r\nAND\r\n$3\r\ndst\r\n";
+    require(route_request(invalid_bitop).status == RouteStatus::invalid,
+            "BITOP requires a source key");
+    const std::string eval_same_slot =
+            "*5\r\n$4\r\nEVAL\r\n$8\r\nreturn 1\r\n$1\r\n2\r\n"
+            "$5\r\n{a}:1\r\n$5\r\n{a}:2\r\n";
+    require(route_request(eval_same_slot).status == RouteStatus::ok,
+            "route same-slot EVAL keys");
+    const std::string xread_same_slot =
+            "*6\r\n$5\r\nXREAD\r\n$5\r\nCOUNT\r\n$1\r\n1\r\n"
+            "$7\r\nSTREAMS\r\n$5\r\n{a}:1\r\n$1\r\n0\r\n";
+    require(route_request(xread_same_slot).status == RouteStatus::ok,
+            "route XREAD stream keys");
+    require(route_request("GET key\r\n").status == RouteStatus::ok,
+            "route inline single-key command");
 
     std::string slots =
             "*1\r\n"

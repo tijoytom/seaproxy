@@ -46,6 +46,8 @@ Available options:
       benchmark duration (default 10s)
 -backend-stats-addr string
       optional direct Redis address used to report backend connections created and closed
+-cluster
+      use the Redis Cluster client
 -keyspace int
       number of keys to use (default 10000)
 -key-hash-tag string
@@ -54,6 +56,10 @@ Available options:
       file containing the frontend password
 -set-percent int
       percentage of operations that are SETs (default 20)
+-tls
+      use TLS for the Redis connection
+-tls-server-name string
+      TLS certificate server name; empty uses the host from -addr
 -transaction-size int
       number of GET/SET commands queued in each MULTI transaction (default 2)
 -value-size int
