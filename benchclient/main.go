@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	cryptorand "crypto/rand"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -36,6 +37,9 @@ type config struct {
 	keyHashTag       string
 	username         string
 	password         string
+	tls              bool
+	cluster          bool
+	tlsServerName    string
 }
 
 type counters struct {
@@ -117,6 +121,14 @@ func parseFlags() config {
 		"optional Redis Cluster hash tag applied to every benchmark key",
 	)
 	flag.StringVar(&cfg.username, "username", "", "frontend ACL username")
+	flag.BoolVar(&cfg.tls, "tls", false, "use TLS for the Redis connection")
+	flag.BoolVar(&cfg.cluster, "cluster", false, "use the Redis Cluster client")
+	flag.StringVar(
+		&cfg.tlsServerName,
+		"tls-server-name",
+		"",
+		"TLS certificate server name; empty uses the host from -addr",
+	)
 	var passwordFile string
 	flag.StringVar(
 		&passwordFile,
@@ -169,6 +181,9 @@ func parseFlags() config {
 	}
 	if cfg.username != "" && cfg.password == "" {
 		log.Fatal("-username requires -password-file")
+	}
+	if !cfg.tls && cfg.tlsServerName != "" {
+		log.Fatal("-tls-server-name requires -tls")
 	}
 
 	return cfg
@@ -324,7 +339,7 @@ func run(cfg config) error {
 
 func runWorker(
 	ctx context.Context,
-	client *redis.Client,
+	client redis.UniversalClient,
 	cfg config,
 	workerID int,
 	value []byte,
@@ -381,7 +396,7 @@ func runWorker(
 
 func runTransaction(
 	ctx context.Context,
-	client *redis.Client,
+	client redis.UniversalClient,
 	cfg config,
 	workerID int,
 	value []byte,
@@ -454,24 +469,59 @@ func nextKey(cfg config, workerID int, operation *uint64) string {
 	return fmt.Sprintf("benchclient:%d", keyNumber)
 }
 
-func newClient(cfg config, totals *connectionCounters) *redis.Client {
-	dialer := &net.Dialer{}
+func newClient(cfg config, totals *connectionCounters) redis.UniversalClient {
+	netDialer := &net.Dialer{}
+	var tlsConfig *tls.Config
+	if cfg.tls {
+		serverName := cfg.tlsServerName
+		if serverName == "" {
+			var err error
+			serverName, _, err = net.SplitHostPort(cfg.address)
+			if err != nil {
+				log.Fatalf("parse -addr for TLS server name: %v", err)
+			}
+		}
+		tlsConfig = &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			ServerName: serverName,
+		}
+	}
+	dial := func(ctx context.Context, network, address string) (net.Conn, error) {
+		var connection net.Conn
+		var err error
+		if tlsConfig == nil {
+			connection, err = netDialer.DialContext(ctx, network, address)
+		} else {
+			tlsDialer := &tls.Dialer{
+				NetDialer: netDialer,
+				Config:    tlsConfig,
+			}
+			connection, err = tlsDialer.DialContext(ctx, network, address)
+		}
+		if err != nil {
+			return nil, err
+		}
+		totals.created.Add(1)
+		return &countedConnection{
+			Conn:   connection,
+			totals: totals,
+		}, nil
+	}
+	if cfg.cluster {
+		return redis.NewClusterClient(&redis.ClusterOptions{
+			Addrs:    []string{cfg.address},
+			PoolSize: cfg.concurrency,
+			Username: cfg.username,
+			Password: cfg.password,
+			Dialer:   dial,
+		})
+	}
 	return redis.NewClient(&redis.Options{
 		Addr:     cfg.address,
 		PoolSize: cfg.concurrency,
 		Username: cfg.username,
 		Password: cfg.password,
-		Dialer: func(ctx context.Context, network, address string) (net.Conn, error) {
-			connection, err := dialer.DialContext(ctx, network, address)
-			if err != nil {
-				return nil, err
-			}
-			totals.created.Add(1)
-			return &countedConnection{
-				Conn:   connection,
-				totals: totals,
-			}, nil
-		},
+		Dialer:   dial,
 	})
 }
 

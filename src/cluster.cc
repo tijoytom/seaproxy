@@ -31,14 +31,24 @@ bool equal_ascii_case(std::string_view left, std::string_view right) {
 }
 
 std::uint16_t crc16(std::string_view value) {
+    static constexpr auto table = [] {
+        std::array<std::uint16_t, 256> result{};
+        for (std::size_t index = 0; index < result.size(); ++index) {
+            auto crc = static_cast<std::uint16_t>(index << 8);
+            for (int bit = 0; bit < 8; ++bit) {
+                crc = (crc & 0x8000) != 0
+                        ? static_cast<std::uint16_t>((crc << 1) ^ 0x1021)
+                        : static_cast<std::uint16_t>(crc << 1);
+            }
+            result[index] = crc;
+        }
+        return result;
+    }();
+
     std::uint16_t crc = 0;
     for (const unsigned char byte : value) {
-        crc ^= static_cast<std::uint16_t>(byte) << 8;
-        for (int bit = 0; bit < 8; ++bit) {
-            crc = (crc & 0x8000) != 0
-                    ? static_cast<std::uint16_t>((crc << 1) ^ 0x1021)
-                    : static_cast<std::uint16_t>(crc << 1);
-        }
+        const auto index = static_cast<unsigned char>((crc >> 8) ^ byte);
+        crc = static_cast<std::uint16_t>((crc << 8) ^ table[index]);
     }
     return crc;
 }
@@ -205,18 +215,34 @@ bool is_first_key_command(std::string_view command) {
     });
 }
 
-Route route_keys(const std::vector<std::string_view>& keys) {
-    if (keys.empty()) {
-        return {RouteStatus::no_key, std::nullopt};
+class SlotAccumulator {
+public:
+    bool add(std::string_view key) {
+        const auto slot = key_slot(key);
+        if (!_slot) {
+            _slot = slot;
+            return true;
+        }
+        if (*_slot != slot) {
+            _cross_slot = true;
+            return false;
+        }
+        return true;
     }
-    const auto slot = key_slot(keys.front());
-    for (const auto key : keys) {
-        if (key_slot(key) != slot) {
+
+    Route result() const {
+        if (_cross_slot) {
             return {RouteStatus::cross_slot, std::nullopt};
         }
+        return _slot
+                ? Route{RouteStatus::ok, _slot}
+                : Route{RouteStatus::no_key, std::nullopt};
     }
-    return {RouteStatus::ok, slot};
-}
+
+private:
+    std::optional<std::uint16_t> _slot;
+    bool _cross_slot{false};
+};
 
 std::optional<std::size_t> argument_count(std::string_view text) {
     std::size_t count = 0;
@@ -228,16 +254,37 @@ std::optional<std::size_t> argument_count(std::string_view text) {
     return count;
 }
 
-Route route_range(
-        const std::vector<std::string_view>& arguments,
-        std::size_t first,
-        std::size_t count) {
-    if (first > arguments.size() || count > arguments.size() - first) {
-        return {RouteStatus::invalid, std::nullopt};
+Route route_next(resp::CommandParser& parser, std::size_t count) {
+    SlotAccumulator slots;
+    for (std::size_t index = 0; index < count; ++index) {
+        const auto key = parser.next();
+        if (!key) {
+            return {RouteStatus::invalid, std::nullopt};
+        }
+        slots.add(*key);
     }
-    return route_keys(std::vector<std::string_view>(
-            arguments.begin() + first,
-            arguments.begin() + first + count));
+    return slots.result();
+}
+
+Route route_remaining(resp::CommandParser& parser) {
+    SlotAccumulator slots;
+    while (const auto key = parser.next()) {
+        slots.add(*key);
+    }
+    return parser.valid()
+            ? slots.result()
+            : Route{RouteStatus::invalid, std::nullopt};
+}
+
+std::optional<std::size_t> remaining_count(resp::CommandParser parser) {
+    if (const auto remaining = parser.remaining()) {
+        return remaining;
+    }
+    std::size_t count = 0;
+    while (parser.next()) {
+        ++count;
+    }
+    return parser.valid() ? std::optional<std::size_t>(count) : std::nullopt;
 }
 
 }  // namespace
@@ -247,28 +294,32 @@ std::uint16_t key_slot(std::string_view key) {
 }
 
 Route route_request(std::string_view request) {
-    const auto parsed = resp::command_arguments(request);
-    if (!parsed || parsed->empty()) {
+    resp::CommandParser parser(request);
+    const auto parsed_command = parser.next();
+    if (!parsed_command) {
         return {RouteStatus::invalid, std::nullopt};
     }
-    const auto command = parsed->front();
+    const auto command = *parsed_command;
     if (is_no_key_command(command)) {
         return {RouteStatus::no_key, std::nullopt};
     }
     if (is_all_key_arguments(command)) {
-        return route_keys(std::vector<std::string_view>(
-                parsed->begin() + 1, parsed->end()));
+        return route_remaining(parser);
     }
     if (equal_ascii_case(command, "MSET") ||
         equal_ascii_case(command, "MSETNX")) {
-        if (parsed->size() < 3 || parsed->size() % 2 == 0) {
+        SlotAccumulator slots;
+        std::size_t count = 0;
+        while (const auto argument = parser.next()) {
+            if (count % 2 == 0) {
+                slots.add(*argument);
+            }
+            ++count;
+        }
+        if (!parser.valid() || count < 2 || count % 2 != 0) {
             return {RouteStatus::invalid, std::nullopt};
         }
-        std::vector<std::string_view> keys;
-        for (std::size_t index = 1; index < parsed->size(); index += 2) {
-            keys.push_back((*parsed)[index]);
-        }
-        return route_keys(keys);
+        return slots.result();
     }
     static constexpr std::string_view two_key_commands[] = {
             "BLMOVE", "BRPOPLPUSH", "COPY", "LMOVE", "RENAME",
@@ -278,112 +329,128 @@ Route route_request(std::string_view request) {
                 two_key_commands, [command] (auto candidate) {
                     return equal_ascii_case(command, candidate);
                 })) {
-        return route_range(*parsed, 1, 2);
+        return route_next(parser, 2);
     }
     if (equal_ascii_case(command, "SMOVE")) {
-        return route_range(*parsed, 1, 2);
+        return route_next(parser, 2);
     }
     if (equal_ascii_case(command, "BITOP")) {
-        if (parsed->size() < 4) {
+        if (!parser.next()) {
             return {RouteStatus::invalid, std::nullopt};
         }
-        return route_range(*parsed, 2, parsed->size() - 2);
+        const auto count = remaining_count(parser);
+        return count && *count >= 2
+                ? route_next(parser, *count)
+                : Route{RouteStatus::invalid, std::nullopt};
     }
     if (equal_ascii_case(command, "BLPOP") ||
         equal_ascii_case(command, "BRPOP") ||
         equal_ascii_case(command, "BZPOPMAX") ||
         equal_ascii_case(command, "BZPOPMIN")) {
-        if (parsed->size() < 3) {
+        const auto count = remaining_count(parser);
+        if (!count || *count < 2) {
             return {RouteStatus::invalid, std::nullopt};
         }
-        return route_range(*parsed, 1, parsed->size() - 2);
+        return route_next(parser, *count - 1);
     }
     if (equal_ascii_case(command, "ZDIFF") ||
         equal_ascii_case(command, "ZINTER") ||
         equal_ascii_case(command, "ZUNION") ||
         equal_ascii_case(command, "SINTERCARD")) {
-        if (parsed->size() < 2) {
-            return {RouteStatus::invalid, std::nullopt};
-        }
-        const auto count = argument_count((*parsed)[1]);
+        const auto count_argument = parser.next();
+        const auto count = count_argument
+                ? argument_count(*count_argument)
+                : std::nullopt;
         return count
-                ? route_range(*parsed, 2, *count)
+                ? route_next(parser, *count)
                 : Route{RouteStatus::invalid, std::nullopt};
     }
     if (equal_ascii_case(command, "ZDIFFSTORE") ||
         equal_ascii_case(command, "ZINTERSTORE") ||
         equal_ascii_case(command, "ZUNIONSTORE")) {
-        if (parsed->size() < 3) {
+        const auto destination = parser.next();
+        const auto count_argument = parser.next();
+        if (!destination || !count_argument) {
             return {RouteStatus::invalid, std::nullopt};
         }
-        const auto count = argument_count((*parsed)[2]);
+        const auto count = argument_count(*count_argument);
         if (!count) {
             return {RouteStatus::invalid, std::nullopt};
         }
-        auto keys = std::vector<std::string_view>{(*parsed)[1]};
-        if (3 + *count > parsed->size()) {
-            return {RouteStatus::invalid, std::nullopt};
+        SlotAccumulator slots;
+        slots.add(*destination);
+        for (std::size_t index = 0; index < *count; ++index) {
+            const auto key = parser.next();
+            if (!key) {
+                return {RouteStatus::invalid, std::nullopt};
+            }
+            slots.add(*key);
         }
-        keys.insert(
-                keys.end(), parsed->begin() + 3,
-                parsed->begin() + 3 + *count);
-        return route_keys(keys);
+        return slots.result();
     }
     if (equal_ascii_case(command, "LMPOP") ||
         equal_ascii_case(command, "ZMPOP")) {
-        if (parsed->size() < 2) {
-            return {RouteStatus::invalid, std::nullopt};
-        }
-        const auto count = argument_count((*parsed)[1]);
+        const auto count_argument = parser.next();
+        const auto count = count_argument
+                ? argument_count(*count_argument)
+                : std::nullopt;
         return count
-                ? route_range(*parsed, 2, *count)
+                ? route_next(parser, *count)
                 : Route{RouteStatus::invalid, std::nullopt};
     }
     if (equal_ascii_case(command, "BLMPOP") ||
         equal_ascii_case(command, "BZMPOP")) {
-        if (parsed->size() < 3) {
+        if (!parser.next()) {
             return {RouteStatus::invalid, std::nullopt};
         }
-        const auto count = argument_count((*parsed)[2]);
+        const auto count_argument = parser.next();
+        const auto count = count_argument
+                ? argument_count(*count_argument)
+                : std::nullopt;
         return count
-                ? route_range(*parsed, 3, *count)
+                ? route_next(parser, *count)
                 : Route{RouteStatus::invalid, std::nullopt};
     }
     if (equal_ascii_case(command, "XREAD") ||
         equal_ascii_case(command, "XREADGROUP")) {
-        auto streams = std::ranges::find_if(
-                *parsed, [] (std::string_view argument) {
-                    return equal_ascii_case(argument, "STREAMS");
-                });
-        if (streams == parsed->end()) {
+        bool found_streams = false;
+        while (const auto argument = parser.next()) {
+            if (equal_ascii_case(*argument, "STREAMS")) {
+                found_streams = true;
+                break;
+            }
+        }
+        if (!found_streams) {
             return {RouteStatus::invalid, std::nullopt};
         }
-        const auto first = static_cast<std::size_t>(
-                std::distance(parsed->begin(), streams)) + 1;
-        const auto remaining = parsed->size() - first;
-        if (remaining == 0 || remaining % 2 != 0) {
+        const auto remaining = remaining_count(parser);
+        if (!remaining || *remaining == 0 || *remaining % 2 != 0) {
             return {RouteStatus::invalid, std::nullopt};
         }
-        return route_range(*parsed, first, remaining / 2);
+        return route_next(parser, *remaining / 2);
     }
     if (equal_ascii_case(command, "EVAL") ||
         equal_ascii_case(command, "EVALSHA") ||
         equal_ascii_case(command, "FCALL") ||
         equal_ascii_case(command, "FCALL_RO")) {
-        if (parsed->size() < 3) {
+        if (!parser.next()) {
             return {RouteStatus::invalid, std::nullopt};
         }
-        const auto count = argument_count((*parsed)[2]);
-        if (!count || *count > parsed->size() - 3) {
+        const auto count_argument = parser.next();
+        const auto count = count_argument
+                ? argument_count(*count_argument)
+                : std::nullopt;
+        if (!count) {
             return {RouteStatus::invalid, std::nullopt};
         }
-        return route_range(*parsed, 3, *count);
+        return route_next(parser, *count);
     }
     if (is_first_key_command(command)) {
-        if (parsed->size() < 2) {
+        const auto key = parser.next();
+        if (!key) {
             return {RouteStatus::invalid, std::nullopt};
         }
-        return {RouteStatus::ok, key_slot((*parsed)[1])};
+        return {RouteStatus::ok, key_slot(*key)};
     }
     return {RouteStatus::unsupported, std::nullopt};
 }

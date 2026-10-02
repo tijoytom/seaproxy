@@ -145,91 +145,132 @@ std::optional<std::size_t> parse_frame(
     }
 }
 
-std::optional<std::string_view> array_argument(
-        std::string_view frame,
-        std::size_t index) {
-    const auto header_end = find_crlf(frame, 1);
-    if (!header_end) {
-        return std::nullopt;
-    }
-    const auto count = parse_count(frame.substr(1, *header_end - 1));
-    if (!count || index >= *count) {
-        return std::nullopt;
-    }
-
-    auto position = *header_end + 2;
-    for (std::size_t item = 0; item <= index; ++item) {
-        if (position >= frame.size()) {
-            return std::nullopt;
-        }
-        if (frame[position] == '$') {
-            const auto length_end = find_crlf(frame, position + 1);
-            if (!length_end) {
-                return std::nullopt;
-            }
-            const auto length = parse_count(frame.substr(
-                    position + 1, *length_end - position - 1));
-            if (!length) {
-                return std::nullopt;
-            }
-            const auto data_start = *length_end + 2;
-            if (*length > frame.size() - data_start) {
-                return std::nullopt;
-            }
-            const auto argument = frame.substr(data_start, *length);
-            if (item == index) {
-                return argument;
-            }
-            position = data_start + *length + 2;
-        } else if (frame[position] == '+') {
-            const auto argument_end = find_crlf(frame, position + 1);
-            if (!argument_end) {
-                return std::nullopt;
-            }
-            const auto argument =
-                    frame.substr(position + 1, *argument_end - position - 1);
-            if (item == index) {
-                return argument;
-            }
-            position = *argument_end + 2;
-        } else {
-            return std::nullopt;
-        }
-    }
-    return std::nullopt;
-}
-
-std::optional<std::string_view> inline_argument(
-        std::string_view frame,
-        std::size_t index) {
-    const auto line_end = find_crlf(frame, 0);
-    if (!line_end) {
-        return std::nullopt;
-    }
-    const auto line = frame.substr(0, *line_end);
-    std::size_t position = 0;
-    std::size_t current = 0;
-    while (position < line.size()) {
-        while (position < line.size() &&
-               (line[position] == ' ' || line[position] == '\t')) {
-            ++position;
-        }
-        const auto start = position;
-        while (position < line.size() &&
-               line[position] != ' ' && line[position] != '\t') {
-            ++position;
-        }
-        if (start != position) {
-            if (current == index) {
-                return line.substr(start, position - start);
-            }
-            ++current;
-        }
-    }
-    return std::nullopt;
-}
-
 }  // namespace
+
+CommandParser::CommandParser(std::string_view frame)
+    : _frame(frame) {
+    if (_frame.empty()) {
+        _valid = false;
+        return;
+    }
+    if (!_frame.starts_with('*')) {
+        const auto line_end = find_crlf(_frame, 0);
+        if (!line_end || *line_end + 2 != _frame.size()) {
+            _valid = false;
+            return;
+        }
+        _inline_end = *line_end;
+        return;
+    }
+
+    _array = true;
+    const auto header_end = find_crlf(_frame, 1);
+    if (!header_end) {
+        _valid = false;
+        return;
+    }
+    try {
+        const auto count = parse_count(
+                _frame.substr(1, *header_end - 1));
+        if (!count) {
+            _valid = false;
+            return;
+        }
+        _remaining = *count;
+        _position = *header_end + 2;
+    } catch (const std::runtime_error&) {
+        _valid = false;
+    }
+}
+
+std::optional<std::string_view> CommandParser::next() {
+    if (!_valid) {
+        return std::nullopt;
+    }
+    if (!_array) {
+        while (_position < _inline_end &&
+               (_frame[_position] == ' ' || _frame[_position] == '\t')) {
+            ++_position;
+        }
+        if (_position == _inline_end) {
+            return std::nullopt;
+        }
+        const auto start = _position;
+        while (_position < _inline_end &&
+               _frame[_position] != ' ' && _frame[_position] != '\t') {
+            ++_position;
+        }
+        return _frame.substr(start, _position - start);
+    }
+    if (_remaining == 0) {
+        if (_position != _frame.size()) {
+            _valid = false;
+        }
+        return std::nullopt;
+    }
+    if (_position >= _frame.size()) {
+        _valid = false;
+        return std::nullopt;
+    }
+
+    std::string_view argument;
+    if (_frame[_position] == '$') {
+        const auto length_end = find_crlf(_frame, _position + 1);
+        if (!length_end) {
+            _valid = false;
+            return std::nullopt;
+        }
+        std::optional<std::size_t> length;
+        try {
+            length = parse_count(_frame.substr(
+                    _position + 1, *length_end - _position - 1));
+        } catch (const std::runtime_error&) {
+            _valid = false;
+            return std::nullopt;
+        }
+        if (!length) {
+            _valid = false;
+            return std::nullopt;
+        }
+        const auto data_start = *length_end + 2;
+        if (*length > _frame.size() - data_start) {
+            _valid = false;
+            return std::nullopt;
+        }
+        const auto data_end = data_start + *length;
+        if (data_end + 2 > _frame.size() ||
+            _frame.substr(data_end, 2) != "\r\n") {
+            _valid = false;
+            return std::nullopt;
+        }
+        argument = _frame.substr(data_start, *length);
+        _position = data_end + 2;
+    } else if (_frame[_position] == '+') {
+        const auto argument_end = find_crlf(_frame, _position + 1);
+        if (!argument_end) {
+            _valid = false;
+            return std::nullopt;
+        }
+        argument = _frame.substr(
+                _position + 1, *argument_end - _position - 1);
+        _position = *argument_end + 2;
+    } else {
+        _valid = false;
+        return std::nullopt;
+    }
+    --_remaining;
+    return argument;
+}
+
+std::optional<std::size_t> CommandParser::remaining() const noexcept {
+    return _array && _valid
+            ? std::optional<std::size_t>(_remaining)
+            : std::nullopt;
+}
+
+bool CommandParser::valid() const noexcept {
+    return _valid;
+}
 
 std::optional<std::size_t> frame_length(std::string_view buffer) {
     if (buffer.empty()) {
@@ -241,13 +282,22 @@ std::optional<std::size_t> frame_length(std::string_view buffer) {
 std::optional<std::string_view> command_argument(
         std::string_view frame,
         std::size_t index) {
-    return frame.starts_with('*')
-            ? array_argument(frame, index)
-            : inline_argument(frame, index);
+    CommandParser parser(frame);
+    for (std::size_t current = 0; current <= index; ++current) {
+        const auto argument = parser.next();
+        if (!argument) {
+            return std::nullopt;
+        }
+        if (current == index) {
+            return argument;
+        }
+    }
+    return std::nullopt;
 }
 
 std::optional<std::string_view> command_name(std::string_view frame) {
-    const auto command = command_argument(frame, 0);
+    CommandParser parser(frame);
+    const auto command = parser.next();
     if (!command || command->empty()) {
         return std::nullopt;
     }
@@ -262,14 +312,11 @@ std::optional<std::string_view> command_name(std::string_view frame) {
 std::optional<std::vector<std::string_view>> command_arguments(
         std::string_view frame) {
     std::vector<std::string_view> arguments;
-    for (std::size_t index = 0;; ++index) {
-        auto argument = command_argument(frame, index);
-        if (!argument) {
-            break;
-        }
+    CommandParser parser(frame);
+    while (auto argument = parser.next()) {
         arguments.push_back(*argument);
     }
-    if (arguments.empty()) {
+    if (!parser.valid() || arguments.empty()) {
         return std::nullopt;
     }
     return arguments;
