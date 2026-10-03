@@ -1,25 +1,43 @@
-# This starter workflow is for a CMake project running on a single platform. There is a different starter workflow if you need cross-platform coverage.
-# See: https://github.com/actions/starter-workflows/blob/main/ci/cmake-multi-platform.yml
-name: CMake on a single platform
+name: Pull request validation
 
 on:
   push:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  merge_group:
+    types: [checks_requested]
 
 env:
-  # Customize the CMake build type here (Release, Debug, RelWithDebInfo, etc.)
   BUILD_TYPE: Release
 
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-validation-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  build-and-test:
+    name: Build, unit, and end-to-end tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v4
 
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: "1.23.x"
+        cache-dependency-path: benchclient/go.sum
+
     - name: Install dependencies, build, and test
       run: |
         sudo apt-get update
+        sudo apt-get install --yes redis-server
         JOBS=2 ./build.sh
+
+    - name: Run end-to-end test
+      run: ./tests/run_e2e.sh
