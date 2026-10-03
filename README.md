@@ -141,6 +141,12 @@ For example, a GitHub Actions build step can use:
 JOBS=2 ./build.sh
 ```
 
+Pull requests to `main` run the build, unit tests, and a Redis end-to-end test
+covering ordinary `SET`/`GET` commands and a connection-scoped `MULTI`/`EXEC`
+transaction. Configure the `Build, unit, and end-to-end tests` check as
+required in the `main` branch ruleset so failed or pending checks block
+merging.
+
 ### Native release packages
 
 After building, create Ubuntu 24.04 AMD64 `.deb` and `.tar.gz` packages with
