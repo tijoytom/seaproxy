@@ -16,21 +16,9 @@ cross cores.
 - Backend TLS support using Seastar OpenSSL integration.
 
 Ordinary commands such as `GET` and `SET` use the multiplexed pool.
-Connection-scoped, blocking, transaction, and Pub/Sub commands switch the
-client to a private backend connection for the remainder of that client
-connection. On a clean client EOF, SeaProxy drains every expected response,
-sends Redis `RESET`, validates the exact response, and returns the sanitized
+Connection-scoped, switch the client to a private backend connection for the remainder of that client connection. On a clean client EOF, SeaProxy drains every expected response, sends Redis `RESET` and returns the sanitized
 connection to its shard-local pool. This avoids reconnect churn for short
-transaction and connection-scoped sessions without leaking state such as
-`AUTH`, `WATCH`, or client configuration.
-
-SeaProxy conservatively closes and replaces a private connection when its
-state cannot be proven clean. This includes partial requests, missing or
-unexpected responses, reset failures, active blocking commands at disconnect,
-and asynchronous modes such as Pub/Sub and `MONITOR`. The Redis user must have permission to run `RESET` for a private connection to be reusable.
-
-
-TLS is supported for connections from SeaProxy to Redis. Frontend TLS is not
+transaction and connection-scoped sessions.SeaProxy conservatively closes and replaces a private connection when its state cannot be proven clean. TLS is supported for connections from SeaProxy to Redis. Frontend TLS is not
 implemented.
 
 ## Redis Cluster
