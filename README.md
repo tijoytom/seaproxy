@@ -4,7 +4,9 @@ SeaProxy is a shard-per-core Redis multiplexing proxy implemented in C++ with
 [Seastar](https://github.com/scylladb/seastar). Each Seastar shard owns its
 listener, backend connections, queues, and client state, so requests do not
 cross cores.
-
+## AI Disclosure 
+Most of the benchmark, test and build scripts are AI generated. Design and most 
+of the code is human written.
 ## Architecture
 
 - One or more multiplexed Redis connections per shard(per core).
