@@ -25,14 +25,14 @@ implemented.
 
 ## Redis Cluster
 
-`--redis-mode auto` sends `CLUSTER INFO` to the configured Redis entry point
+`redis.mode = "auto"` sends `CLUSTER INFO` to the configured Redis entry point
 before accepting clients. A valid cluster response selects cluster mode; the
 specific "cluster support disabled" response selects standalone mode. Any
 authentication, permission, network, or unexpected protocol error fails
 startup rather than silently selecting the wrong mode.
 
-The selected mode cannot change during the process lifetime. Use
-`--redis-mode standalone` to skip detection or `--redis-mode cluster` to
+The selected mode cannot change during the process lifetime. Configure
+`redis.mode = "standalone"` to skip detection or `redis.mode = "cluster"` to
 require cluster mode explicitly.
 
 In cluster mode, every Seastar shard:
@@ -52,20 +52,23 @@ In cluster mode, every Seastar shard:
 SeaProxy supports separate backend and frontend credentials. Passwords are
 loaded from files rather than command-line values so they are not exposed in
 the process argument list. Trailing CR and LF bytes are removed from secret
-files.
+files. Relative password-file paths in a TOML configuration are resolved
+relative to that configuration file.
 
-Backend authentication options:
+Backend authentication settings:
 
-```text
---redis-username <acl-user>
---redis-password-file <path>
+```toml
+[redis]
+username = "service"
+password_file = "/run/secrets/redis-password"
 ```
 
-Frontend authentication options:
+Frontend authentication settings:
 
-```text
---frontend-username <client-user>
---frontend-password-file <path>
+```toml
+[frontend]
+username = "application"
+password_file = "/run/secrets/frontend-password"
 ```
 
 When a frontend password is configured, every client starts unauthenticated.
@@ -78,15 +81,16 @@ private pool is rejected by closing that client session, preventing it from
 replacing SeaProxy's configured backend identity.
 
 
-Enable backend TLS with `--redis-tls`. SeaProxy verifies the Redis certificate
-using the system trust store and `--redis-address` as the expected certificate
-name. Use `--redis-tls-ca-file` for a private PEM CA bundle or
-`--redis-tls-server-name` when the certificate name differs from the address
-used to connect. Frontend credentials still travel as plaintext.
+Backend TLS is enabled by default with `redis.tls = true`. SeaProxy verifies
+the Redis certificate using the system trust store and `redis.address` as the
+expected certificate name. Set `redis.tls_ca_file` for a private PEM CA bundle
+or `redis.tls_server_name` when the certificate name differs from the address
+used to connect. Set `redis.tls = false` only for an explicitly trusted
+plaintext backend. Frontend credentials still travel as plaintext.
 
 ## Admission control
 
-`--max-clients-per-shard` bounds simultaneously active frontend connections.
+`listener.max_clients_per_shard` bounds simultaneously active frontend connections.
 The default is 10,000 per shard, so a three-shard process admits at most 30,000
 clients. Once a shard reaches its limit, newly accepted sockets are closed
 immediately. Rejections do not create background tasks or consume admission
@@ -94,8 +98,8 @@ slots, preventing the rejection path itself from growing without bound.
 
 Private Redis connections have two independent settings:
 
-- `--private-pool-size` is the warm idle target.
-- `--private-max-connections` is the hard total of idle, checked-out, and
+- `pools.private_pool_size_per_shard` is the warm idle target.
+- `pools.private_max_connections_per_shard` is the hard total of idle, checked-out, and
   connecting sockets.
 
 When a private pool reaches its hard maximum, additional connection-scoped
@@ -105,7 +109,7 @@ connection releases capacity so a waiter can create its replacement. In
 cluster mode, both values apply independently to every primary on every
 SeaProxy shard.
 
-`--private-pool-size` must not exceed `--private-max-connections`. Waiting
+The private warm pool size must not exceed its maximum. Waiting
 private sessions still occupy frontend admission slots, so the frontend limit
 also bounds the private checkout wait queue.
 
@@ -139,27 +143,22 @@ merging.
 
 ## Run
 
+SeaProxy requires application settings in a TOML file parsed with
+[toml++](https://github.com/marzer/tomlplusplus).
+[`src/config.toml`](src/config.toml) contains every available setting at its
+built-in default. [`seaproxy.toml.example`](seaproxy.toml.example) is a
+deployment-oriented example with authentication, TLS, and deadlines enabled:
+
 ```sh
 ./build/seaproxy \
-  --listen-address 0.0.0.0 \
-  --listen-port 7000 \
-  --redis-address 127.0.0.1 \
-  --redis-port 6379 \
-  --redis-mode auto \
-  --redis-tls \
-  --redis-username service \
-  --redis-password-file /run/secrets/redis-password \
-  --frontend-username application \
-  --frontend-password-file /run/secrets/frontend-password \
-  --redis-pool-size 1 \
-  --pipeline-depth 64 \
-  --private-pool-size 10 \
-  --private-max-connections 64 \
-  --worker-queue-capacity 1024 \
-  --max-clients-per-shard 10000 \
+  --config ./seaproxy.toml \
   --smp 3 \
   --cpuset 1,3,5
 ```
+
+`--config` is the only SeaProxy application option. Seastar runtime options
+such as `--smp`, `--memory`, and `--reactor-backend` remain command-line
+options.
 
 seastar is built with `io_uring`, `linux-aio`, and `epoll` support.
 On the current TCP proxy benchmark, `epoll` is
@@ -168,31 +167,31 @@ Explicit option `--reactor-backend io_uring` overrides the SeaProxy
 default. Seastar also requires an appropriate memory allocation for the host. For small development runs, for example:
 
 ```sh
-./build/seaproxy --smp 1 --memory 256M --overprovisioned
+./build/seaproxy \
+  --config ./seaproxy.toml \
+  --smp 1 \
+  --memory 256M \
+  --overprovisioned
 ```
 
-Application options:
+The `[listener]`, `[redis]`, `[frontend]`, and `[pools]` tables configure the
+listener, credentials, backend transport, and shard-local limits described
+above. An empty or omitted password file disables authentication for that
+side.
 
-| Option | Default | Description |
-|---|---:|---|
-| `--listen-address` | `0.0.0.0` | Proxy listen address |
-| `--listen-port` | `7000` | Proxy listen port |
-| `--redis-address` | `127.0.0.1` | Redis backend address |
-| `--redis-port` | `6379` | Redis backend port |
-| `--redis-mode` | `auto` | Backend mode: `auto`, `standalone`, or `cluster`; immutable after startup |
-| `--redis-username` | empty | Redis backend ACL username; empty uses password-only `AUTH` |
-| `--redis-password-file` | empty | File containing the Redis backend password |
-| `--redis-tls` | disabled | Encrypt and authenticate Redis backend connections |
-| `--redis-tls-ca-file` | empty | PEM CA bundle for Redis TLS; empty uses system trust |
-| `--redis-tls-server-name` | empty | Expected Redis certificate name; empty uses `--redis-address` |
-| `--frontend-username` | empty | Username required from clients; requires a frontend password |
-| `--frontend-password-file` | empty | File containing the password required from clients |
-| `--redis-pool-size` | `1` | Multiplexed connections per shard |
-| `--pipeline-depth` | `64` | Maximum in-flight requests per backend connection |
-| `--private-pool-size` | `10` | Preconnected private connections per shard and, in cluster mode, per primary; zero connects on demand |
-| `--private-max-connections` | `64` | Hard private connection limit per shard-local pool; must be at least the warm pool size |
-| `--worker-queue-capacity` | `1024` | Queued requests per multiplexed connection |
-| `--max-clients-per-shard` | `10000` | Maximum active frontend connections accepted by each shard |
+The `[timeouts]` table supports:
+`backend_connect_ms`, `backend_response_ms`, `private_checkout_ms`,
+`client_idle_ms`, and `backend_reconnect_delay_ms`. The first four accept zero
+to disable their deadline; the reconnect delay must be positive and defaults
+to 100 ms.
+
+A multiplexed response timeout aborts that backend connection, fails its
+pending pipeline, and allows the worker to reconnect after the configured
+delay. The response deadline also covers startup queries, authentication,
+connection reset, and cluster transactions. It does not apply to the private
+relay after a connection-scoped command, because blocking commands and
+subscriptions can legitimately wait indefinitely. For the same reason, the
+frontend idle timeout stops applying after a client enters private mode.
 
 Use `--help-seastar` to see Seastar options such as `--smp`, `--cpuset`, and
 `--memory`.
