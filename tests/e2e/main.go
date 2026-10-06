@@ -35,6 +35,9 @@ func main() {
 	expect(connection, reader, "scoped", "GET", "e2e:transaction")
 	expect(connection, reader, int64(2), "DEL", "e2e:ordinary", "e2e:transaction")
 
+	testClientIdleTimeout(port)
+	testPrivateCheckoutTimeout(port)
+
 	fmt.Println("SeaProxy end-to-end test passed")
 }
 
@@ -54,15 +57,22 @@ func connect(address string) (net.Conn, *bufio.Reader, error) {
 }
 
 func run(connection net.Conn, reader *bufio.Reader, arguments ...string) (any, error) {
+	if err := writeRequest(connection, arguments...); err != nil {
+		return nil, err
+	}
+	return readResponse(reader)
+}
+
+func writeRequest(connection net.Conn, arguments ...string) error {
 	var request strings.Builder
 	fmt.Fprintf(&request, "*%d\r\n", len(arguments))
 	for _, argument := range arguments {
 		fmt.Fprintf(&request, "$%d\r\n%s\r\n", len(argument), argument)
 	}
 	if _, err := io.WriteString(connection, request.String()); err != nil {
-		return nil, err
+		return err
 	}
-	return readResponse(reader)
+	return nil
 }
 
 func readResponse(reader *bufio.Reader) (any, error) {
@@ -138,5 +148,37 @@ func expect(connection net.Conn, reader *bufio.Reader, expected any, arguments .
 	must(err)
 	if !reflect.DeepEqual(actual, expected) {
 		panic(fmt.Sprintf("expected %#v, got %#v", expected, actual))
+	}
+}
+
+func testClientIdleTimeout(port string) {
+	connection, reader, err := connect("127.0.0.1:" + port)
+	must(err)
+	defer connection.Close()
+
+	time.Sleep(300 * time.Millisecond)
+	_, err = run(connection, reader, "PING")
+	if err == nil {
+		panic("expected idle frontend connection to be closed")
+	}
+}
+
+func testPrivateCheckoutTimeout(port string) {
+	blocked, _, err := connect("127.0.0.1:" + port)
+	must(err)
+	defer blocked.Close()
+	must(writeRequest(blocked, "BLPOP", "e2e:never", "0"))
+
+	time.Sleep(50 * time.Millisecond)
+	waiting, reader, err := connect("127.0.0.1:" + port)
+	must(err)
+	defer waiting.Close()
+	started := time.Now()
+	_, err = run(waiting, reader, "BLPOP", "e2e:also-never", "0")
+	if err == nil {
+		panic("expected private connection checkout to time out")
+	}
+	if elapsed := time.Since(started); elapsed < 100*time.Millisecond {
+		panic(fmt.Sprintf("private checkout failed too quickly: %s", elapsed))
 	}
 }

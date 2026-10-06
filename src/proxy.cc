@@ -198,6 +198,71 @@ struct RedisConnection {
     RespReader reader;
 };
 
+seastar::future<std::optional<seastar::sstring>> read_redis_response(
+        RedisConnection& connection,
+        std::chrono::milliseconds timeout,
+        std::string_view operation) {
+    if (timeout.count() == 0) {
+        co_return co_await connection.reader.read_response();
+    }
+
+    bool timed_out = false;
+    seastar::timer<> timer([&connection, &timed_out] {
+        timed_out = true;
+        connection.abort();
+    });
+    timer.arm(seastar::steady_clock_type::now() + timeout);
+    try {
+        auto response = co_await connection.reader.read_response();
+        timer.cancel();
+        if (timed_out) {
+            throw std::runtime_error(
+                    std::string(operation) + " timed out");
+        }
+        co_return response;
+    } catch (...) {
+        timer.cancel();
+        if (timed_out) {
+            throw std::runtime_error(
+                    std::string(operation) + " timed out");
+        }
+        throw;
+    }
+}
+
+seastar::future<std::optional<seastar::sstring>> read_client_request(
+        RespReader& reader,
+        seastar::connected_socket& socket,
+        std::chrono::milliseconds timeout) {
+    if (timeout.count() == 0) {
+        co_return co_await reader.read_frame();
+    }
+
+    bool timed_out = false;
+    seastar::timer<> timer([&socket, &timed_out] {
+        timed_out = true;
+        try {
+            socket.shutdown_input();
+        } catch (...) {
+        }
+    });
+    timer.arm(seastar::steady_clock_type::now() + timeout);
+    try {
+        auto request = co_await reader.read_frame();
+        timer.cancel();
+        if (timed_out) {
+            throw std::runtime_error("frontend client idle timeout");
+        }
+        co_return request;
+    } catch (...) {
+        timer.cancel();
+        if (timed_out) {
+            throw std::runtime_error("frontend client idle timeout");
+        }
+        throw;
+    }
+}
+
 struct BackendCredentials {
     std::string username;
     std::string password;
@@ -219,7 +284,10 @@ public:
         , _server_name(
                   config.redis_tls_server_name.empty()
                           ? config.redis_address
-                          : config.redis_tls_server_name) {
+                          : config.redis_tls_server_name)
+        , _connect_timeout(config.backend_connect_timeout_ms)
+        , _response_timeout(config.backend_response_timeout_ms)
+        , _reconnect_delay(config.backend_reconnect_delay_ms) {
     }
 
     seastar::future<> start() {
@@ -238,24 +306,43 @@ public:
 
     seastar::future<seastar::connected_socket> connect(
             seastar::socket_address address) const {
-        if (!_tls) {
-            co_return co_await seastar::engine().net().connect(address);
+        auto connection = [this, address] {
+            if (!_tls) {
+                return seastar::engine().net().connect(address);
+            }
+            if (!_credentials) {
+                throw std::logic_error(
+                        "Redis TLS connector used before initialization");
+            }
+            seastar::tls::tls_options options;
+            options.server_name = _server_name;
+            options.wait_for_eof_on_shutdown = false;
+            return seastar::tls::connect(
+                    _credentials, address, std::move(options));
+        }();
+        if (_connect_timeout.count() == 0) {
+            co_return co_await std::move(connection);
         }
-        if (!_credentials) {
-            throw std::logic_error(
-                    "Redis TLS connector used before initialization");
-        }
-        seastar::tls::tls_options options;
-        options.server_name = _server_name;
-        options.wait_for_eof_on_shutdown = false;
-        co_return co_await seastar::tls::connect(
-                _credentials, address, std::move(options));
+        co_return co_await seastar::with_timeout(
+                seastar::steady_clock_type::now() + _connect_timeout,
+                std::move(connection));
+    }
+
+    std::chrono::milliseconds response_timeout() const noexcept {
+        return _response_timeout;
+    }
+
+    std::chrono::milliseconds reconnect_delay() const noexcept {
+        return _reconnect_delay;
     }
 
 private:
     bool _tls;
     std::string _ca_file;
     seastar::sstring _server_name;
+    std::chrono::milliseconds _connect_timeout;
+    std::chrono::milliseconds _response_timeout;
+    std::chrono::milliseconds _reconnect_delay;
     seastar::shared_ptr<seastar::tls::certificate_credentials> _credentials;
 };
 
@@ -269,7 +356,8 @@ void append_bulk(seastar::sstring& request, std::string_view value) {
 
 seastar::future<bool> authenticate_redis(
         RedisConnection& connection,
-        const BackendCredentials& credentials) {
+        const BackendCredentials& credentials,
+        std::chrono::milliseconds response_timeout) {
     if (!credentials.enabled()) {
         co_return true;
     }
@@ -282,7 +370,8 @@ seastar::future<bool> authenticate_redis(
     append_bulk(request, credentials.password);
     co_await connection.output.write(request.data(), request.size());
     co_await connection.output.flush();
-    auto response = co_await connection.reader.read_response();
+    auto response = co_await read_redis_response(
+            connection, response_timeout, "Redis authentication");
     co_return response &&
             std::string_view(response->data(), response->size()) ==
                     "+OK\r\n" &&
@@ -297,13 +386,19 @@ seastar::future<seastar::sstring> query_redis(
     auto socket = co_await connector.connect(address);
     RedisConnection connection(std::move(socket));
     try {
-        if (!co_await authenticate_redis(connection, credentials)) {
+        if (!co_await authenticate_redis(
+                    connection,
+                    credentials,
+                    connector.response_timeout())) {
             throw std::runtime_error(
                     "Redis backend authentication failed");
         }
         co_await connection.output.write(request.data(), request.size());
         co_await connection.output.flush();
-        auto response = co_await connection.reader.read_response();
+        auto response = co_await read_redis_response(
+                connection,
+                connector.response_timeout(),
+                "Redis startup query");
         if (!response) {
             throw std::runtime_error(
                     "Redis closed the detection connection without a response");
@@ -324,7 +419,10 @@ seastar::future<> validate_redis_connection(
     auto socket = co_await connector.connect(address);
     RedisConnection connection(std::move(socket));
     try {
-        if (!co_await authenticate_redis(connection, credentials)) {
+        if (!co_await authenticate_redis(
+                    connection,
+                    credentials,
+                    connector.response_timeout())) {
             throw std::runtime_error(
                     "Redis backend authentication failed");
         }
@@ -342,11 +440,13 @@ public:
             seastar::socket_address address,
             std::size_t target,
             std::size_t maximum,
+            std::chrono::milliseconds checkout_timeout,
             std::shared_ptr<BackendConnector> connector,
             BackendCredentials credentials)
         : _address(address)
         , _target(target)
         , _maximum(maximum)
+        , _checkout_timeout(checkout_timeout)
         , _connector(std::move(connector))
         , _credentials(std::move(credentials)) {
         if (_target > _maximum) {
@@ -368,10 +468,20 @@ public:
                !_stopping) {
             ++_waiters;
             try {
-                co_await _connection_available.when([this] {
+                const auto available = [this] {
                     return _stopping || !_idle.empty() ||
                             connection_count() < _maximum;
-                });
+                };
+                if (_checkout_timeout.count() == 0) {
+                    co_await _connection_available.when(available);
+                } else {
+                    co_await _connection_available.when(
+                            _checkout_timeout, available);
+                }
+            } catch (const seastar::condition_variable_timed_out&) {
+                --_waiters;
+                throw std::runtime_error(
+                        "private Redis connection checkout timed out");
             } catch (...) {
                 --_waiters;
                 throw;
@@ -430,7 +540,10 @@ private:
         auto socket = co_await _connector->connect(_address);
         auto connection =
                 std::make_unique<RedisConnection>(std::move(socket));
-        if (!co_await authenticate_redis(*connection, _credentials)) {
+        if (!co_await authenticate_redis(
+                    *connection,
+                    _credentials,
+                    _connector->response_timeout())) {
             connection->abort();
             throw std::runtime_error(
                     "private Redis connection authentication failed");
@@ -471,6 +584,7 @@ private:
     seastar::socket_address _address;
     std::size_t _target;
     std::size_t _maximum;
+    std::chrono::milliseconds _checkout_timeout;
     std::shared_ptr<BackendConnector> _connector;
     BackendCredentials _credentials;
     std::vector<std::unique_ptr<RedisConnection>> _idle;
@@ -551,7 +665,9 @@ private:
                 _connection =
                         std::make_unique<RedisConnection>(std::move(socket));
                 if (!co_await authenticate_redis(
-                            *_connection, _credentials)) {
+                            *_connection,
+                            _credentials,
+                            _connector->response_timeout())) {
                     throw std::runtime_error(
                             "multiplexed Redis connection authentication failed");
                 }
@@ -564,7 +680,8 @@ private:
             }
             _connection.reset();
             if (!_stopping) {
-                co_await seastar::sleep(100ms);
+                co_await seastar::sleep(
+                        _connector->reconnect_delay());
             }
         }
     }
@@ -615,7 +732,10 @@ private:
             for (std::size_t index = 0;
                  index < _pending.front()->response_count;
                  ++index) {
-                response = co_await _connection->reader.read_response();
+                response = co_await read_redis_response(
+                        *_connection,
+                        _connector->response_timeout(),
+                        "multiplexed Redis response");
                 if (!response) {
                     throw std::runtime_error(
                             "Redis closed the connection without a response");
@@ -650,7 +770,8 @@ private:
 
 seastar::future<bool> reset_private_connection(
         RedisConnection& backend,
-        const BackendCredentials& credentials);
+        const BackendCredentials& credentials,
+        std::chrono::milliseconds response_timeout);
 
 class RedisPool {
 public:
@@ -660,10 +781,13 @@ public:
             std::size_t private_pool_size,
             std::shared_ptr<BackendConnector> connector)
         : _credentials(backend_credentials(config))
+        , _response_timeout(config.backend_response_timeout_ms)
         , _private(
                   address,
                   private_pool_size,
                   config.private_max_connections,
+                  std::chrono::milliseconds(
+                          config.private_checkout_timeout_ms),
                   connector,
                   _credentials) {
         _workers.reserve(config.redis_pool_size);
@@ -707,7 +831,11 @@ public:
 
     seastar::future<bool> sanitize_private(RedisConnection& connection) {
         co_return co_await reset_private_connection(
-                connection, _credentials);
+                connection, _credentials, _response_timeout);
+    }
+
+    std::chrono::milliseconds response_timeout() const noexcept {
+        return _response_timeout;
     }
 
     seastar::future<> stop() {
@@ -721,6 +849,7 @@ private:
     std::vector<std::unique_ptr<BackendWorker>> _workers;
     std::size_t _next_worker{0};
     BackendCredentials _credentials;
+    std::chrono::milliseconds _response_timeout;
     PrivateConnectionPool _private;
 };
 
@@ -896,7 +1025,10 @@ public:
                     pipeline.data(), pipeline.size());
             co_await connection->output.flush();
 
-            auto response = co_await connection->reader.read_response();
+            auto response = co_await read_redis_response(
+                    *connection,
+                    pool.response_timeout(),
+                    "Redis MULTI response");
             if (!response ||
                 std::string_view(response->data(), response->size()) !=
                         "+OK\r\n") {
@@ -904,13 +1036,19 @@ public:
                         "Redis rejected MULTI on a private cluster connection");
             }
             for (std::size_t index = 0; index < requests.size(); ++index) {
-                response = co_await connection->reader.read_response();
+                response = co_await read_redis_response(
+                        *connection,
+                        pool.response_timeout(),
+                        "Redis transaction queue response");
                 if (!response) {
                     throw std::runtime_error(
                             "Redis closed while queueing a transaction");
                 }
             }
-            result = co_await connection->reader.read_response();
+            result = co_await read_redis_response(
+                    *connection,
+                    pool.response_timeout(),
+                    "Redis EXEC response");
             if (!result) {
                 throw std::runtime_error(
                         "Redis closed without an EXEC response");
@@ -1165,20 +1303,23 @@ seastar::future<> relay_private_backend_responses(
 
 seastar::future<bool> reset_private_connection(
         RedisConnection& backend,
-        const BackendCredentials& credentials) {
+        const BackendCredentials& credentials,
+        std::chrono::milliseconds response_timeout) {
     static constexpr std::string_view reset_request =
             "*1\r\n$5\r\nRESET\r\n";
     co_await backend.output.write(
             reset_request.data(), reset_request.size());
     co_await backend.output.flush();
-    auto response = co_await backend.reader.read_response();
+    auto response = co_await read_redis_response(
+            backend, response_timeout, "Redis RESET response");
     if (!response ||
         std::string_view(response->data(), response->size()) !=
                 "+RESET\r\n" ||
         !backend.reader.buffer_empty()) {
         co_return false;
     }
-    co_return co_await authenticate_redis(backend, credentials);
+    co_return co_await authenticate_redis(
+            backend, credentials, response_timeout);
 }
 
 seastar::future<> relay_private(
@@ -1416,7 +1557,11 @@ seastar::future<> handle_client(
     });
 
     while (true) {
-        auto request = co_await reader.read_frame();
+        auto request = co_await read_client_request(
+                reader,
+                socket,
+                std::chrono::milliseconds(
+                        config.client_idle_timeout_ms));
         if (!request) {
             break;
         }
@@ -1461,15 +1606,18 @@ seastar::future<> handle_client(
 
 seastar::future<bool> handle_cluster_transaction(
         RespReader& reader,
+        seastar::connected_socket& socket,
         seastar::output_stream<char>& output,
-        ClusterRedisPool& pool) {
+        ClusterRedisPool& pool,
+        std::chrono::milliseconds client_idle_timeout) {
     std::vector<seastar::sstring> requests;
     std::optional<std::uint16_t> transaction_slot;
     std::optional<std::size_t> transaction_node;
     bool dirty = false;
 
     while (true) {
-        auto request = co_await reader.read_frame();
+        auto request = co_await read_client_request(
+                reader, socket, client_idle_timeout);
         if (!request) {
             co_return false;
         }
@@ -1560,7 +1708,11 @@ seastar::future<> handle_cluster_client(
     });
 
     while (true) {
-        auto request = co_await reader.read_frame();
+        auto request = co_await read_client_request(
+                reader,
+                socket,
+                std::chrono::milliseconds(
+                        config.client_idle_timeout_ms));
         if (!request) {
             break;
         }
@@ -1581,7 +1733,12 @@ seastar::future<> handle_cluster_client(
                 co_await output.write("+OK\r\n");
                 co_await output.flush();
                 if (!co_await handle_cluster_transaction(
-                            reader, output, pool)) {
+                            reader,
+                            socket,
+                            output,
+                            pool,
+                            std::chrono::milliseconds(
+                                    config.client_idle_timeout_ms))) {
                     break;
                 }
                 continue;

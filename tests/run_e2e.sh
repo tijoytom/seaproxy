@@ -7,6 +7,7 @@ readonly BUILD_DIR="${BUILD_DIR:-${ROOT_DIR}/build}"
 readonly REDIS_PORT="${REDIS_PORT:-16379}"
 readonly SEAPROXY_PORT="${SEAPROXY_PORT:-17000}"
 readonly LOG_DIR="${LOG_DIR:-${BUILD_DIR}/e2e-logs}"
+readonly CONFIG_FILE="${LOG_DIR}/seaproxy.toml"
 
 mkdir -p "${LOG_DIR}"
 redis_pid=""
@@ -57,15 +58,29 @@ if ! redis-cli -h 127.0.0.1 -p "${REDIS_PORT}" PING >/dev/null 2>&1; then
     exit 1
 fi
 
+cat >"${CONFIG_FILE}" <<EOF
+[listener]
+address = "127.0.0.1"
+port = ${SEAPROXY_PORT}
+
+[redis]
+address = "127.0.0.1"
+port = ${REDIS_PORT}
+mode = "standalone"
+tls = false
+
+[pools]
+multiplexed_connections_per_shard = 1
+private_pool_size_per_shard = 1
+private_max_connections_per_shard = 1
+
+[timeouts]
+private_checkout_ms = 150
+client_idle_ms = 150
+EOF
+
 "${BUILD_DIR}/seaproxy" \
-    --listen-address 127.0.0.1 \
-    --listen-port "${SEAPROXY_PORT}" \
-    --redis-address 127.0.0.1 \
-    --redis-port "${REDIS_PORT}" \
-    --redis-mode standalone \
-    --redis-pool-size 1 \
-    --private-pool-size 1 \
-    --private-max-connections 2 \
+    --config "${CONFIG_FILE}" \
     --smp 1 \
     --memory 256M \
     --overprovisioned \

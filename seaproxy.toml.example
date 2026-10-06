@@ -1,0 +1,32 @@
+[listener]
+address = "0.0.0.0"
+port = 7000
+max_clients_per_shard = 10000
+
+[redis]
+address = "127.0.0.1"
+port = 6379
+mode = "auto"
+username = "service"
+password_file = "/run/secrets/redis-password"
+tls = true
+tls_ca_file = ""
+tls_server_name = ""
+
+[frontend]
+username = "application"
+password_file = "/run/secrets/frontend-password"
+
+[pools]
+multiplexed_connections_per_shard = 1
+pipeline_depth = 64
+private_pool_size_per_shard = 10
+private_max_connections_per_shard = 64
+worker_queue_capacity = 1024
+
+[timeouts]
+backend_connect_ms = 5000
+backend_response_ms = 30000
+private_checkout_ms = 5000
+client_idle_ms = 300000
+backend_reconnect_delay_ms = 100
