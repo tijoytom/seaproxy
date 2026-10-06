@@ -142,42 +142,29 @@ required in the `main` branch ruleset so failed or pending checks block
 merging.
 
 ## Run
-
-SeaProxy requires application settings in a TOML file parsed with
-[toml++](https://github.com/marzer/tomlplusplus).
-[`src/config.toml`](src/config.toml) contains every available setting at its
-built-in default. [`seaproxy.toml.example`](seaproxy.toml.example) is a
-deployment-oriented example with authentication, TLS, and deadlines enabled:
+You can find a config with defaults in src directory.
 
 ```sh
 ./build/seaproxy \
-  --config ./seaproxy.toml \
+  --config ./config.toml \
   --smp 3 \
   --cpuset 1,3,5
 ```
-
-`--config` is the only SeaProxy application option. Seastar runtime options
-such as `--smp`, `--memory`, and `--reactor-backend` remain command-line
-options.
-
-seastar is built with `io_uring`, `linux-aio`, and `epoll` support.
-On the current TCP proxy benchmark, `epoll` is
+Seastar runtime options such as `--smp`, `--memory`, and `--reactor-backend` is
+available as command line options. The seastar is built with `io_uring`, `linux-aio`, and `epoll` support. On the current TCP proxy benchmark, `epoll` is
 fastest and is therefore used by SeaProxy when no reactor option is supplied.
 Explicit option `--reactor-backend io_uring` overrides the SeaProxy
 default. Seastar also requires an appropriate memory allocation for the host. For small development runs, for example:
 
 ```sh
 ./build/seaproxy \
-  --config ./seaproxy.toml \
+  --config ./config.toml \
   --smp 1 \
   --memory 256M \
   --overprovisioned
 ```
 
-The `[listener]`, `[redis]`, `[frontend]`, and `[pools]` tables configure the
-listener, credentials, backend transport, and shard-local limits described
-above. An empty or omitted password file disables authentication for that
-side.
+## Timeouts
 
 The `[timeouts]` table supports:
 `backend_connect_ms`, `backend_response_ms`, `private_checkout_ms`,
